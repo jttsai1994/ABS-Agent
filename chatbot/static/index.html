@@ -291,6 +291,13 @@ mark.hl { background: var(--highlight); color: inherit; padding: 0 2px; border-r
   padding: 10px 14px; border-radius: 10px; display: flex; align-items: center; gap: 10px;
   font-size: 13px;
 }
+.err-content { flex: 1; display: flex; flex-direction: column; gap: 6px; }
+.err-command {
+  display: block; width: fit-content; max-width: 100%; overflow-x: auto;
+  padding: 4px 7px; border-radius: 4px; background: rgba(255,255,255,.65);
+  font-family: "Consolas", monospace; user-select: all;
+}
+.err-login-link { color: inherit; font-weight: 700; text-decoration: underline; }
 html[data-theme="dark"] .err-banner { background: #450a0a; border-color: #b91c1c; color: #fecaca; }
 .err-banner button {
   margin-left: auto; background: #b91c1c; color: #fff; border: none;
@@ -795,7 +802,7 @@ async function sendMessage(textOverride) {
           break outer;
         } else if (event.type === 'error') {
           bubble.parentElement.parentElement.remove();
-          showErrorBanner(event.text);
+          showErrorBanner(event.text, event.action_url, event.action_label, event.command);
           break outer;
         }
       }
@@ -827,19 +834,28 @@ function setSendButtonStop(stop) {
   document.getElementById('stop-icon').style.display = stop ? '' : 'none';
 }
 
-function showErrorBanner(msg) {
+function showErrorBanner(msg, actionUrl = null, actionLabel = null, command = null) {
   hideEmpty();
   const box = document.getElementById('messages');
   const wrap = document.createElement('div');
   wrap.className = 'msg-wrap ai';
+  const safeActionUrl = actionUrl === 'https://microsoft.com/devicelogin' ? actionUrl : null;
+  const commandHtml = command ? `<code class="err-command">${escHtml(command)}</code>` : '';
+  const actionHtml = safeActionUrl
+    ? `<a class="err-login-link" href="${safeActionUrl}" target="_blank" rel="noopener noreferrer">${escHtml(actionLabel || '開啟登入頁')}</a>`
+    : '';
   wrap.innerHTML = `<div class="avatar ai">!</div>
     <div class="msg-body" style="max-width:80%">
       <div class="err-banner">
-        <span>⚠️ ${escHtml(msg || '發生未知錯誤')}</span>
-        <button>重試</button>
+        <span class="err-content">
+          <span>⚠️ ${escHtml(msg || '發生未知錯誤')}</span>
+          ${commandHtml}
+          ${actionHtml}
+        </span>
+        <button class="err-retry">重試</button>
       </div>
     </div>`;
-  wrap.querySelector('button').onclick = () => {
+  wrap.querySelector('.err-retry').onclick = () => {
     wrap.remove();
     if (lastSendPayload) sendMessage(lastSendPayload.text);
   };

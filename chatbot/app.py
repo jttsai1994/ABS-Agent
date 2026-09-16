@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -43,12 +44,15 @@ from pydantic import BaseModel
 
 load_dotenv(Path(__file__).with_name(".env"))
 
+logger = logging.getLogger(__name__)
+
 CHAT_PROVIDER: str = os.getenv("CHAT_PROVIDER", "rag").strip().lower()
 RAG_BASE_URL: str = os.getenv("RAG_BASE_URL", "http://localhost:8000")
 RAG_API_KEY: str = os.getenv("RAG_API_KEY", "")
 FOUNDRY_PROJECT_ENDPOINT: str = os.getenv("FOUNDRY_PROJECT_ENDPOINT", "").strip()
 FOUNDRY_AGENT_NAME: str = os.getenv("FOUNDRY_AGENT_NAME", "").strip()
 FOUNDRY_AGENT_VERSION: str = os.getenv("FOUNDRY_AGENT_VERSION", "").strip()
+AZURE_TENANT_ID: str = os.getenv("AZURE_TENANT_ID", "").strip()
 DB_PATH: str = os.getenv("CHAT_DB_PATH", str(Path(__file__).parent / "chat.db"))
 CHATBOT_API_KEY: str = os.getenv("CHATBOT_API_KEY", "")
 HISTORY_LIMIT: int = 200  # max messages returned per session
@@ -148,6 +152,39 @@ def _is_followup(message: str, history: list[dict]) -> bool:
     return False
 
 
+def _foundry_error_event(exc: Exception) -> dict[str, str]:
+    """Return a safe client error while keeping credential details server-side."""
+    details = " ".join(
+        str(error) for error in (exc, exc.__cause__, exc.__context__) if error is not None
+    ).lower()
+    auth_markers = (
+        "defaultazurecredential",
+        "clientauthenticationerror",
+        "credentialunavailable",
+        "failed to retrieve a token",
+        "refresh token has expired",
+        "azureclicredential",
+    )
+    if any(marker in details for marker in auth_markers):
+        command = "az login --use-device-code"
+        if AZURE_TENANT_ID:
+            command += f" --tenant {AZURE_TENANT_ID}"
+        return {
+            "type": "error",
+            "code": "azure_auth_required",
+            "text": "Azure 登入已失效。請在啟動服務的終端機重新登入，完成後按「重試」。",
+            "command": command,
+            "action_url": "https://microsoft.com/devicelogin",
+            "action_label": "開啟 Microsoft 裝置登入頁",
+        }
+
+    return {
+        "type": "error",
+        "code": "foundry_request_failed",
+        "text": "Foundry Agent 暫時無法使用，請稍後重試；詳細資訊請查看伺服器日誌。",
+    }
+
+
 def _call_foundry_agent_sync(
     message: str,
     history: list[dict[str, str]],
@@ -220,9 +257,7 @@ async def _stream_foundry_agent(
         from azure.ai.projects.aio import AIProjectClient
         from azure.identity.aio import DefaultAzureCredential
     except ImportError as exc:
-        raise RuntimeError(
-            "缺少 Foundry 非同步 SDK；請安裝 chatbot/requirements.txt"
-        ) from exc
+        raise RuntimeError("缺少 Foundry 非同步 SDK；請安裝 chatbot/requirements.txt") from exc
 
     agent_input = [
         {"role": item["role"], "content": item["content"]}
@@ -270,9 +305,10 @@ async def _request_chat_backend(
                 history,
             )
         except Exception as exc:
+            logger.exception("Foundry Agent request failed")
             raise HTTPException(
                 status_code=502,
-                detail=f"Foundry Agent 呼叫失敗：{exc}",
+                detail=_foundry_error_event(exc),
             ) from exc
         return answer, []
 
@@ -543,7 +579,8 @@ async def chat_stream(req: ChatRequest, _: None = Security(_check_key)):
                     event = {"type": "token", "text": delta}
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             except Exception as exc:
-                event = {"type": "error", "text": f"Foundry Agent 串流失敗：{exc}"}
+                logger.exception("Foundry Agent streaming request failed")
+                event = _foundry_error_event(exc)
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 return
 
