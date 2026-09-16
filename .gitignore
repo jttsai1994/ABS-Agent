@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Virtual envs
+.venv/
+venv/
+
+# Secrets (但 .env.example 除外 — 用作模板)
+.env
+.env.*
+!.env.example
+
+# RAG runtime data (Qdrant persistent storage)
+qdrant_data/
+
+# Local chatbot runtime data
+*.db
+*.db-shm
+*.db-wal
+
+# Logs / OS
+*.log
+Thumbs.db
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+.kilo/
