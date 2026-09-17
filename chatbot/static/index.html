@@ -141,19 +141,17 @@ html[data-theme="dark"] #btn-clear:hover { background: #7f1d1d; border-color: #b
 }
 .menu-pop button:hover { background: var(--accent-soft); color: var(--accent); }
 
-/* ── Filter bar ──────────────────────────────────────────────── */
+/* ── Agent bar ───────────────────────────────────────────────── */
 #filter-bar {
   background: var(--panel-soft); border-bottom: 1px solid var(--border);
   padding: 8px 20px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
 }
 #filter-bar label { font-size: 12px; color: var(--muted); }
-#filter-bar input, #filter-bar select {
+#filter-bar select {
   padding: 4px 8px; border: 1px solid var(--border); border-radius: 5px;
   font-size: 12px; background: var(--panel); color: var(--fg); outline: none;
 }
-#filter-bar input:focus, #filter-bar select:focus { border-color: var(--accent); }
-#filter-cat { width: 160px; }
-#filter-from, #filter-to { width: 100px; }
+#filter-bar select:focus { border-color: var(--accent); }
 #agent-select { min-width: 190px; }
 
 /* ── Messages ────────────────────────────────────────────────── */
@@ -265,13 +263,16 @@ mark.hl { background: var(--highlight); color: inherit; padding: 0 2px; border-r
   border-radius: 4px; padding: 2px 7px; font-family: "Consolas", monospace; font-size: 12px;
 }
 
-/* typing */
-.typing-dot {
+/* Agent thinking indicator */
+.typing-indicator {
   display: inline-flex; gap: 4px; align-items: center; padding: 8px 12px;
   background: var(--ai-bubble); border: 1px solid var(--border); border-radius: 12px; border-top-left-radius: 4px;
+  color: var(--muted); font-size: 13px;
 }
+.typing-label { margin-right: 4px; }
+.typing-dot { display: inline-flex; gap: 4px; align-items: center; }
 .typing-dot span {
-  width: 7px; height: 7px; background: #93c5fd; border-radius: 50%;
+  width: 6px; height: 6px; background: #93c5fd; border-radius: 50%;
   animation: bounce 1.2s infinite ease-in-out;
 }
 .typing-dot span:nth-child(2) { animation-delay: .2s; }
@@ -437,19 +438,6 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb { background: #475569; }
       <select id="agent-select" disabled>
         <option value="">載入中…</option>
       </select>
-      <label>分類篩選</label>
-      <input id="filter-cat" type="text" placeholder="例：FIT > Lab" />
-      <label>日期起</label>
-      <input id="filter-from" type="text" placeholder="202401" maxlength="10" />
-      <label>日期迄</label>
-      <input id="filter-to" type="text" placeholder="202412" maxlength="10" />
-      <label>筆數</label>
-      <select id="filter-topk">
-        <option value="3">3</option>
-        <option value="5" selected>5</option>
-        <option value="10">10</option>
-        <option value="20">20</option>
-      </select>
     </div>
 
     <div id="messages">
@@ -573,17 +561,6 @@ function toggleTheme() {
 }
 document.getElementById('btn-theme').textContent =
   (localStorage.getItem('fit_theme') === 'dark') ? '☀' : '🌙';
-
-// ── Query classification ───────────────────────────────────────────────────
-function shouldUseRAG(message) {
-  const msg = message.toLowerCase().trim();
-  if (/^(hi|hello|你好|嗨|哈囉|早|晚|晚安|早安|hey)[\s,。?！!]*$/.test(msg)) return false;
-  if (/^(how|怎麼|如何|怎樣|help|幫助|指引|說明|用法|使用方法|tutorial|guide|教)/.test(msg)) return false;
-  if (/^(who are you|你是誰|你叫什麼|你是|what are you|你的名字|about you|tell me about)/.test(msg)) return false;
-  if (/^(what can|能做|可以幫|功能|features|capabilities|能協助)/.test(msg)) return false;
-  if (msg.length < 5 && !/[a-z0-9]{3,}/i.test(msg)) return false;
-  return true;
-}
 
 // ── Sidebar resize ─────────────────────────────────────────────────────────
 (function initResize() {
@@ -781,11 +758,6 @@ async function sendMessage(textOverride) {
     session_id: sessionId,
     message: text,
     agent_id: selectedAgentId,
-    use_rag: shouldUseRAG(text),
-    top_k: parseInt(document.getElementById('filter-topk').value),
-    category_filter: document.getElementById('filter-cat').value.trim() || null,
-    date_from: document.getElementById('filter-from').value.trim() || null,
-    date_to:   document.getElementById('filter-to').value.trim() || null,
   };
   lastSendPayload = { text, payload };
 
@@ -802,9 +774,7 @@ async function sendMessage(textOverride) {
       const err = await res.json().catch(() => ({ detail: res.statusText }));
       throw new Error(err.detail || res.statusText);
     }
-    typingEl.remove();
-    const { bubble, sourcesContainer, metaContainer } = createStreamingBubble();
-    scrollBottom();
+    let streamingUi = null;
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -828,19 +798,27 @@ async function sendMessage(textOverride) {
           sessionId = event.session_id;
           localStorage.setItem('fit_session', sessionId);
         } else if (event.type === 'token') {
+          if (!streamingUi) {
+            typingEl.remove();
+            streamingUi = createStreamingBubble();
+          }
           accumulated += event.text;
-          bubble.textContent = accumulated;
+          streamingUi.bubble.textContent = accumulated;
           scrollBottom();
         } else if (event.type === 'sources') {
           sources = event.sources;
         } else if (event.type === 'done') {
+          if (!streamingUi) {
+            typingEl.remove();
+            streamingUi = createStreamingBubble();
+          }
           assistantMsgId = event.message_id || null;
-          bubble.className = 'bubble md';
-          bubble.innerHTML = renderMarkdown(accumulated);
-          decorateCodeBlocks(bubble);
-          if (sources.length > 0) sourcesContainer.innerHTML = buildSourcesHtml(sources);
+          streamingUi.bubble.className = 'bubble md';
+          streamingUi.bubble.innerHTML = renderMarkdown(accumulated);
+          decorateCodeBlocks(streamingUi.bubble);
+          if (sources.length > 0) streamingUi.sourcesContainer.innerHTML = buildSourcesHtml(sources);
           const elapsed = ((performance.now() - startedAt) / 1000).toFixed(1);
-          metaContainer.innerHTML = renderMsgMeta({
+          streamingUi.metaContainer.innerHTML = renderMsgMeta({
             id: assistantMsgId,
             rating: null,
             stats: `${elapsed}s · ${sources.length} 篇來源`,
@@ -852,7 +830,8 @@ async function sendMessage(textOverride) {
           scrollBottom();
           break outer;
         } else if (event.type === 'error') {
-          bubble.parentElement.parentElement.remove();
+          typingEl && typingEl.parentNode && typingEl.remove();
+          streamingUi?.wrap.remove();
           showErrorBanner(event.text, event.action_url, event.action_label, event.command);
           break outer;
         }
@@ -961,7 +940,10 @@ function appendTyping() {
   const wrap = document.createElement('div');
   wrap.className = 'msg-wrap ai';
   wrap.innerHTML = `<div class="avatar ai">AI</div>
-    <div class="typing-dot"><span></span><span></span><span></span></div>`;
+    <div class="typing-indicator" role="status" aria-live="polite">
+      <span class="typing-label">Agent 思考中</span>
+      <span class="typing-dot"><span></span><span></span><span></span></span>
+    </div>`;
   box.appendChild(wrap);
   return wrap;
 }
