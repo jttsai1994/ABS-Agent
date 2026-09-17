@@ -5,9 +5,8 @@ Agent or the existing RAG API. Conversation history is stored in local SQLite.
 
 Environment variables:
     CHAT_PROVIDER  - "foundry_agent" or "rag" (default: rag)
-    FOUNDRY_PROJECT_ENDPOINT - full Foundry project endpoint
-    FOUNDRY_AGENT_NAME - published Foundry agent name
-    FOUNDRY_AGENT_VERSION - published Foundry agent version
+    FOUNDRY_AGENTS_FILE - JSON file containing allowed Foundry agents
+    FOUNDRY_DEFAULT_AGENT_ID - default agent ID from the JSON file
     RAG_BASE_URL   - base URL of the RAG API (default http://localhost:8000)
     RAG_API_KEY    - X-API-Key for RAG API (optional)
     CHAT_DB_PATH   - path to SQLite file (default: ./chat.db)
@@ -49,9 +48,14 @@ logger = logging.getLogger(__name__)
 CHAT_PROVIDER: str = os.getenv("CHAT_PROVIDER", "rag").strip().lower()
 RAG_BASE_URL: str = os.getenv("RAG_BASE_URL", "http://localhost:8000")
 RAG_API_KEY: str = os.getenv("RAG_API_KEY", "")
-FOUNDRY_PROJECT_ENDPOINT: str = os.getenv("FOUNDRY_PROJECT_ENDPOINT", "").strip()
-FOUNDRY_AGENT_NAME: str = os.getenv("FOUNDRY_AGENT_NAME", "").strip()
-FOUNDRY_AGENT_VERSION: str = os.getenv("FOUNDRY_AGENT_VERSION", "").strip()
+FOUNDRY_AGENTS_FILE: str = os.getenv(
+    "FOUNDRY_AGENTS_FILE",
+    str(Path(__file__).with_name("agents.json")),
+).strip()
+FOUNDRY_DEFAULT_AGENT_ID: str = os.getenv(
+    "FOUNDRY_DEFAULT_AGENT_ID",
+    "sharepoint",
+).strip()
 AZURE_TENANT_ID: str = os.getenv("AZURE_TENANT_ID", "").strip()
 DB_PATH: str = os.getenv("CHAT_DB_PATH", str(Path(__file__).parent / "chat.db"))
 CHATBOT_API_KEY: str = os.getenv("CHATBOT_API_KEY", "")
@@ -86,10 +90,14 @@ def _init_db() -> None:
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id  TEXT    PRIMARY KEY,
                 title       TEXT    DEFAULT '新對話',
+                agent_id    TEXT,
                 created_at  REAL    NOT NULL,
                 updated_at  REAL    NOT NULL
             )
         """)
+        session_columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+        if "agent_id" not in session_columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN agent_id TEXT")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,6 +126,47 @@ def _init_db() -> None:
 
 
 _init_db()
+
+
+def _ensure_session(session_id: str, requested_agent_id: str | None) -> str | None:
+    """Create a session or enforce its existing Agent binding."""
+    selected_agent_id: str | None = None
+    if CHAT_PROVIDER == "foundry_agent":
+        selected_agent_id = _get_foundry_agent(requested_agent_id)["id"]
+
+    now = time.time()
+    with sqlite3.connect(DB_PATH) as conn:
+        existing = conn.execute(
+            "SELECT agent_id FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if not existing:
+            conn.execute(
+                "INSERT INTO sessions "
+                "(session_id, title, agent_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, "新對話", selected_agent_id, now, now),
+            )
+            conn.commit()
+            return selected_agent_id
+
+        stored_agent_id = existing[0]
+        if CHAT_PROVIDER != "foundry_agent":
+            return None
+        if not stored_agent_id:
+            conn.execute(
+                "UPDATE sessions SET agent_id = ? WHERE session_id = ?",
+                (selected_agent_id, session_id),
+            )
+            conn.commit()
+            return selected_agent_id
+        if stored_agent_id != selected_agent_id:
+            raise HTTPException(
+                status_code=409,
+                detail="此對話已綁定其他 Agent；請建立新對話後再切換。",
+            )
+        _get_foundry_agent(stored_agent_id)
+        return stored_agent_id
 
 
 def _build_context_history(session_id: str) -> list[dict[str, str]]:
@@ -150,6 +199,62 @@ def _is_followup(message: str, history: list[dict]) -> bool:
     if _FOLLOWUP_RE.match(msg):
         return True
     return False
+
+
+def _load_foundry_agents() -> dict[str, dict[str, str]]:
+    """Load and validate the server-side Foundry Agent allowlist."""
+    if CHAT_PROVIDER != "foundry_agent":
+        return {}
+
+    config_path = Path(FOUNDRY_AGENTS_FILE)
+    if not config_path.is_absolute():
+        config_path = Path(__file__).parent / config_path
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"無法讀取 Foundry Agent 設定檔：{config_path}") from exc
+
+    agents: dict[str, dict[str, str]] = {}
+    for item in raw.get("agents", []):
+        if not item.get("enabled", True):
+            continue
+        required = ("id", "label", "project_endpoint", "agent_name", "version")
+        missing = [name for name in required if not str(item.get(name, "")).strip()]
+        if missing:
+            raise RuntimeError(f"Agent 設定缺少欄位：{', '.join(missing)}")
+        agent_id = str(item["id"]).strip()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,49}", agent_id):
+            raise RuntimeError(f"Agent id 格式無效：{agent_id}")
+        if agent_id in agents:
+            raise RuntimeError(f"Agent id 重複：{agent_id}")
+        endpoint = str(item["project_endpoint"]).strip().rstrip("/")
+        if not endpoint.startswith("https://") or "/api/projects/" not in endpoint:
+            raise RuntimeError(f"Agent Project Endpoint 格式無效：{agent_id}")
+        agents[agent_id] = {
+            "id": agent_id,
+            "label": str(item["label"]).strip(),
+            "project_endpoint": endpoint,
+            "agent_name": str(item["agent_name"]).strip(),
+            "version": str(item["version"]).strip(),
+        }
+
+    if not agents:
+        raise RuntimeError("Foundry Agent 設定檔沒有已啟用的 Agent")
+    if FOUNDRY_DEFAULT_AGENT_ID not in agents:
+        raise RuntimeError(f"FOUNDRY_DEFAULT_AGENT_ID 不存在：{FOUNDRY_DEFAULT_AGENT_ID}")
+    return agents
+
+
+FOUNDRY_AGENTS = _load_foundry_agents()
+
+
+def _get_foundry_agent(agent_id: str | None) -> dict[str, str]:
+    """Resolve a requested ID against the allowlist without exposing endpoints."""
+    selected_id = (agent_id or FOUNDRY_DEFAULT_AGENT_ID).strip()
+    agent = FOUNDRY_AGENTS.get(selected_id)
+    if not agent:
+        raise HTTPException(status_code=400, detail="無效或未啟用的 Agent")
+    return agent
 
 
 def _foundry_error_event(exc: Exception) -> dict[str, str]:
@@ -188,20 +293,9 @@ def _foundry_error_event(exc: Exception) -> dict[str, str]:
 def _call_foundry_agent_sync(
     message: str,
     history: list[dict[str, str]],
+    agent: dict[str, str],
 ) -> str:
     """Use the official Foundry SDK and published agent reference."""
-    missing = [
-        name
-        for name, value in (
-            ("FOUNDRY_PROJECT_ENDPOINT", FOUNDRY_PROJECT_ENDPOINT),
-            ("FOUNDRY_AGENT_NAME", FOUNDRY_AGENT_NAME),
-            ("FOUNDRY_AGENT_VERSION", FOUNDRY_AGENT_VERSION),
-        )
-        if not value
-    ]
-    if missing:
-        raise RuntimeError(f"缺少必要環境變數：{', '.join(missing)}")
-
     try:
         from azure.ai.projects import AIProjectClient
         from azure.identity import DefaultAzureCredential
@@ -217,7 +311,7 @@ def _call_foundry_agent_sync(
 
     with DefaultAzureCredential() as credential:
         with AIProjectClient(
-            endpoint=FOUNDRY_PROJECT_ENDPOINT,
+            endpoint=agent["project_endpoint"],
             credential=credential,
         ) as project_client:
             with project_client.get_openai_client() as openai_client:
@@ -225,8 +319,8 @@ def _call_foundry_agent_sync(
                     input=agent_input,
                     extra_body={
                         "agent_reference": {
-                            "name": FOUNDRY_AGENT_NAME,
-                            "version": FOUNDRY_AGENT_VERSION,
+                            "name": agent["agent_name"],
+                            "version": agent["version"],
                             "type": "agent_reference",
                         }
                     },
@@ -239,20 +333,9 @@ def _call_foundry_agent_sync(
 async def _stream_foundry_agent(
     message: str,
     history: list[dict[str, str]],
+    agent: dict[str, str],
 ) -> AsyncIterator[str]:
     """Yield text deltas from the Foundry Responses streaming API."""
-    missing = [
-        name
-        for name, value in (
-            ("FOUNDRY_PROJECT_ENDPOINT", FOUNDRY_PROJECT_ENDPOINT),
-            ("FOUNDRY_AGENT_NAME", FOUNDRY_AGENT_NAME),
-            ("FOUNDRY_AGENT_VERSION", FOUNDRY_AGENT_VERSION),
-        )
-        if not value
-    ]
-    if missing:
-        raise RuntimeError(f"缺少必要環境變數：{', '.join(missing)}")
-
     try:
         from azure.ai.projects.aio import AIProjectClient
         from azure.identity.aio import DefaultAzureCredential
@@ -268,7 +351,7 @@ async def _stream_foundry_agent(
 
     async with DefaultAzureCredential() as credential:
         async with AIProjectClient(
-            endpoint=FOUNDRY_PROJECT_ENDPOINT,
+            endpoint=agent["project_endpoint"],
             credential=credential,
         ) as project_client:
             async with project_client.get_openai_client() as openai_client:
@@ -276,8 +359,8 @@ async def _stream_foundry_agent(
                     input=agent_input,
                     extra_body={
                         "agent_reference": {
-                            "name": FOUNDRY_AGENT_NAME,
-                            "version": FOUNDRY_AGENT_VERSION,
+                            "name": agent["agent_name"],
+                            "version": agent["version"],
                             "type": "agent_reference",
                         }
                     },
@@ -292,17 +375,20 @@ async def _request_chat_backend(
     question: str,
     history: list[dict[str, str]],
     *,
+    agent_id: str | None,
     use_rag: bool,
     top_k: int,
     category_filter: str | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Call the configured chat provider and normalize its response."""
     if CHAT_PROVIDER == "foundry_agent":
+        agent = _get_foundry_agent(agent_id)
         try:
             answer = await asyncio.to_thread(
                 _call_foundry_agent_sync,
                 question,
                 history,
+                agent,
             )
         except Exception as exc:
             logger.exception("Foundry Agent request failed")
@@ -412,6 +498,7 @@ def _list_sessions(limit: int = 50) -> list[dict[str, Any]]:
                    s.title,
                    s.created_at,
                    s.updated_at,
+                     s.agent_id,
                    MIN(m.content)      AS first_msg,
                    MAX(m.created_at)   AS last_at,
                    COUNT(m.id)         AS msg_count
@@ -425,7 +512,7 @@ def _list_sessions(limit: int = 50) -> list[dict[str, Any]]:
         ).fetchall()
     result = []
     for r in rows:
-        preview = r[4] if r[4] else ""
+        preview = r[5] if r[5] else ""
         if len(preview) > 42:
             preview = preview[:42] + "…"
         result.append(
@@ -434,9 +521,10 @@ def _list_sessions(limit: int = 50) -> list[dict[str, Any]]:
                 "title": r[1],
                 "created_at": r[2],
                 "updated_at": r[3],
+                "agent_id": r[4],
                 "first_msg": preview,
-                "last_at": r[5],
-                "msg_count": r[6],
+                "last_at": r[6],
+                "msg_count": r[7],
             }
         )
     return result
@@ -464,6 +552,7 @@ def _check_key(key: str | None = Security(_api_key_header)) -> None:
 class ChatRequest(BaseModel):
     session_id: str | None = None
     message: str
+    agent_id: str | None = None
     use_rag: bool = True  # 是否使用 RAG 查詢知識庫，預設為 True
     top_k: int = 5
     category_filter: str | None = None
@@ -485,18 +574,7 @@ class ChatResponse(BaseModel):
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, _: None = Security(_check_key)) -> ChatResponse:
     session_id = (req.session_id or "").strip() or str(uuid.uuid4())
-
-    # 如果是新會話，註冊到 sessions 表
-    with sqlite3.connect(DB_PATH) as conn:
-        existing = conn.execute(
-            "SELECT session_id FROM sessions WHERE session_id = ?", (session_id,)
-        ).fetchone()
-        if not existing:
-            conn.execute(
-                "INSERT INTO sessions (session_id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
-                (session_id, "新對話", time.time(), time.time()),
-            )
-            conn.commit()
+    agent_id = _ensure_session(session_id, req.agent_id)
 
     # 建立歷史記憶（在儲存本次訊息之前）
     history = _build_context_history(session_id)
@@ -513,6 +591,7 @@ async def chat(req: ChatRequest, _: None = Security(_check_key)) -> ChatResponse
     answer, sources = await _request_chat_backend(
         backend_question,
         history,
+        agent_id=agent_id,
         use_rag=req.use_rag,
         top_k=req.top_k,
         category_filter=req.category_filter,
@@ -528,18 +607,7 @@ async def chat(req: ChatRequest, _: None = Security(_check_key)) -> ChatResponse
 async def chat_stream(req: ChatRequest, _: None = Security(_check_key)):
     """Streaming version of /api/chat — proxies SSE from RAG /query/stream or /chat/stream."""
     session_id = (req.session_id or "").strip() or str(uuid.uuid4())
-
-    # 如果是新會話，註冊到 sessions 表
-    with sqlite3.connect(DB_PATH) as conn:
-        existing = conn.execute(
-            "SELECT session_id FROM sessions WHERE session_id = ?", (session_id,)
-        ).fetchone()
-        if not existing:
-            conn.execute(
-                "INSERT INTO sessions (session_id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
-                (session_id, "新對話", time.time(), time.time()),
-            )
-            conn.commit()
+    agent_id = _ensure_session(session_id, req.agent_id)
 
     # 建立歷史記憶（在儲存本次訊息之前）
     history = _build_context_history(session_id)
@@ -568,13 +636,18 @@ async def chat_stream(req: ChatRequest, _: None = Security(_check_key)):
     _save(session_id, "user", req.message)  # 儲原始訊息
 
     if CHAT_PROVIDER == "foundry_agent":
+        agent = _get_foundry_agent(agent_id)
 
         async def _generate_foundry():
             yield f"data: {json.dumps({'type': 'session', 'session_id': session_id})}\n\n"
             yield f"data: {json.dumps({'type': 'sources', 'sources': []})}\n\n"
             full_answer: list[str] = []
             try:
-                async for delta in _stream_foundry_agent(backend_question, history):
+                async for delta in _stream_foundry_agent(
+                    backend_question,
+                    history,
+                    agent,
+                ):
                     full_answer.append(delta)
                     event = {"type": "token", "text": delta}
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
@@ -681,25 +754,32 @@ def get_sessions(_: None = Security(_check_key)):
     return _list_sessions()
 
 
+@app.get("/api/agents")
+def get_agents(_: None = Security(_check_key)):
+    """Return safe public metadata; project endpoints remain server-side."""
+    return {
+        "default_agent_id": FOUNDRY_DEFAULT_AGENT_ID,
+        "agents": [
+            {
+                "id": agent["id"],
+                "label": agent["label"],
+                "agent_name": agent["agent_name"],
+                "version": agent["version"],
+            }
+            for agent in FOUNDRY_AGENTS.values()
+        ],
+    }
+
+
 @app.get("/api/health")
 def health(_: None = Security(_check_key)):
     """Report backend selection and whether required configuration is present."""
     if CHAT_PROVIDER == "foundry_agent":
-        missing = [
-            name
-            for name, value in (
-                ("FOUNDRY_PROJECT_ENDPOINT", FOUNDRY_PROJECT_ENDPOINT),
-                ("FOUNDRY_AGENT_NAME", FOUNDRY_AGENT_NAME),
-                ("FOUNDRY_AGENT_VERSION", FOUNDRY_AGENT_VERSION),
-            )
-            if not value
-        ]
         return {
-            "status": "ok" if not missing else "configuration_error",
+            "status": "ok",
             "provider": CHAT_PROVIDER,
-            "agent_name": FOUNDRY_AGENT_NAME or None,
-            "agent_version": FOUNDRY_AGENT_VERSION or None,
-            "missing": missing,
+            "default_agent_id": FOUNDRY_DEFAULT_AGENT_ID,
+            "agent_count": len(FOUNDRY_AGENTS),
         }
     return {
         "status": "ok" if CHAT_PROVIDER == "rag" else "configuration_error",
@@ -780,7 +860,7 @@ def search_sessions(q: str = Query(..., min_length=1), _: None = Security(_check
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
             """
-            SELECT s.session_id, s.title, s.updated_at,
+            SELECT s.session_id, s.title, s.updated_at, s.agent_id,
                    (SELECT content FROM messages
                     WHERE session_id=s.session_id AND content LIKE ?
                     ORDER BY created_at ASC LIMIT 1) AS hit,
@@ -797,7 +877,7 @@ def search_sessions(q: str = Query(..., min_length=1), _: None = Security(_check
             (like, like, like, like),
         ).fetchall()
     results = []
-    for sid, title, updated_at, hit, hit_count in rows:
+    for sid, title, updated_at, agent_id, hit, hit_count in rows:
         snippet = hit or ""
         if len(snippet) > 80:
             idx = snippet.lower().find(q.lower())
@@ -808,6 +888,7 @@ def search_sessions(q: str = Query(..., min_length=1), _: None = Security(_check
                 "session_id": sid,
                 "title": title,
                 "updated_at": updated_at,
+                "agent_id": agent_id,
                 "snippet": snippet,
                 "hit_count": hit_count or 0,
             }
@@ -828,10 +909,17 @@ async def auto_title(session_id: str, _: None = Security(_check_key)):
         "只回傳標題本身、不要任何引號或標點：\n\n"
         f"使用者：{user_msg}\n助理：{ai_msg}"
     )
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT agent_id FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    agent_id = row[0] if row else None
     try:
         answer, _ = await _request_chat_backend(
             prompt,
             [],
+            agent_id=agent_id,
             use_rag=False,
             top_k=1,
         )

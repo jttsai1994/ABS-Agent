@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>FIT 知識庫問答</title>
+<title>FIT Factory GPT</title>
 <style>
 /* ── Theme tokens ────────────────────────────────────────────── */
 :root {
@@ -154,6 +154,7 @@ html[data-theme="dark"] #btn-clear:hover { background: #7f1d1d; border-color: #b
 #filter-bar input:focus, #filter-bar select:focus { border-color: var(--accent); }
 #filter-cat { width: 160px; }
 #filter-from, #filter-to { width: 100px; }
+#agent-select { min-width: 190px; }
 
 /* ── Messages ────────────────────────────────────────────────── */
 #messages {
@@ -400,7 +401,7 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb { background: #475569; }
     <div id="sidebar-resize"></div>
     <div id="sidebar-header">
       <span class="logo">🏭</span>
-      <h1>FIT 知識庫</h1>
+      <h1>FIT Factory GPT</h1>
     </div>
     <button id="btn-new">
       <svg viewBox="0 0 20 20" width="14" height="14" fill="currentColor"><path d="M10 2a1 1 0 011 1v6h6a1 1 0 110 2h-6v6a1 1 0 11-2 0v-6H3a1 1 0 110-2h6V3a1 1 0 011-1z"/></svg>
@@ -432,6 +433,10 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb { background: #475569; }
     </div>
 
     <div id="filter-bar">
+      <label for="agent-select">Agent</label>
+      <select id="agent-select" disabled>
+        <option value="">載入中…</option>
+      </select>
       <label>分類篩選</label>
       <input id="filter-cat" type="text" placeholder="例：FIT > Lab" />
       <label>日期起</label>
@@ -510,6 +515,49 @@ let abortCtl = null;
 let lastSendPayload = null;   // for retry
 let lastUserMsgText = null;   // for regenerate
 let titledThisSession = false;
+let selectedAgentId = localStorage.getItem('fit_agent_id') || null;
+let agentsById = {};
+
+async function loadAgents() {
+  const select = document.getElementById('agent-select');
+  try {
+    const response = await fetch('/api/agents');
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const data = await response.json();
+    agentsById = Object.fromEntries(data.agents.map(agent => [agent.id, agent]));
+    select.innerHTML = '';
+    data.agents.forEach(agent => {
+      const option = document.createElement('option');
+      option.value = agent.id;
+      option.textContent = `${agent.label} (${agent.agent_name} v${agent.version})`;
+      select.appendChild(option);
+    });
+    selectedAgentId = agentsById[selectedAgentId]
+      ? selectedAgentId
+      : data.default_agent_id;
+    select.value = selectedAgentId;
+    select.dataset.loaded = 'true';
+    select.disabled = false;
+    localStorage.setItem('fit_agent_id', selectedAgentId);
+  } catch (error) {
+    select.innerHTML = '<option value="">Agent 設定載入失敗</option>';
+    select.disabled = true;
+    showErrorBanner('無法載入 Agent 清單：' + error.message);
+  }
+}
+
+function selectAgent(agentId, persist = true) {
+  if (!agentId || !agentsById[agentId]) return;
+  selectedAgentId = agentId;
+  document.getElementById('agent-select').value = agentId;
+  if (persist) localStorage.setItem('fit_agent_id', agentId);
+}
+
+document.getElementById('agent-select').addEventListener('change', event => {
+  selectAgent(event.target.value);
+  newSession();
+  toast(`已切換至 ${agentsById[selectedAgentId]?.label || selectedAgentId}`);
+});
 
 // ── Theme ──────────────────────────────────────────────────────────────────
 (function initTheme() {
@@ -583,46 +631,45 @@ function newSession() {
   document.getElementById('topbar-title').textContent = '新對話';
   loadSessions();
 }
-function loadSession(sid) {
+async function loadSession(sid) {
   sessionId = sid;
   titledThisSession = true;  // 既存對話不再自動命名
   localStorage.setItem('fit_session', sid);
   clearMessages();
-  fetch(`/api/history/${encodeURIComponent(sid)}`)
-    .then(r => r.json())
-    .then(msgs => {
-      msgs.forEach(m => appendMessage(m.role, m.content, m.sources || [], false, { id: m.id, rating: m.rating }));
-      fetch(`/api/sessions`).then(r => r.json()).then(sessions => {
-        const s = sessions.find(s => s.session_id === sid);
-        if (s && s.title && s.title !== '新對話') {
-          document.getElementById('topbar-title').textContent = s.title;
-        } else if (msgs.length) {
-          const first = msgs.find(m => m.role === 'user');
-          if (first) document.getElementById('topbar-title').textContent = first.content.slice(0, 40);
-        }
-      });
-      scrollBottom();
-    });
-  loadSessions();
+  try {
+    const [historyResponse, sessionsResponse] = await Promise.all([
+      fetch(`/api/history/${encodeURIComponent(sid)}`),
+      fetch('/api/sessions'),
+    ]);
+    const [msgs, sessions] = await Promise.all([
+      historyResponse.json(),
+      sessionsResponse.json(),
+    ]);
+    const session = sessions.find(item => item.session_id === sid);
+    if (session?.agent_id) selectAgent(session.agent_id);
+    msgs.forEach(m => appendMessage(m.role, m.content, m.sources || [], false, { id: m.id, rating: m.rating }));
+    if (session?.title && session.title !== '新對話') {
+      document.getElementById('topbar-title').textContent = session.title;
+    } else if (msgs.length) {
+      const first = msgs.find(m => m.role === 'user');
+      if (first) document.getElementById('topbar-title').textContent = first.content.slice(0, 40);
+    }
+    scrollBottom();
+    loadSessions();
+  } catch (error) {
+    showErrorBanner('載入對話失敗：' + error.message);
+  }
 }
 
 // ── Init ───────────────────────────────────────────────────────────────────
-(function init() {
+(async function init() {
+  await loadAgents();
   const saved = localStorage.getItem('fit_session');
   if (saved) {
-    fetch(`/api/history/${encodeURIComponent(saved)}`)
-      .then(r => r.json())
-      .then(msgs => {
-        if (!msgs.length) { newSession(); return; }
-        sessionId = saved;
-        titledThisSession = true;
-        msgs.forEach(m => appendMessage(m.role, m.content, m.sources || [], false, { id: m.id, rating: m.rating }));
-        const first = msgs.find(m => m.role === 'user');
-        if (first) document.getElementById('topbar-title').textContent = first.content.slice(0, 40);
-        scrollBottom();
-        loadSessions();
-      })
-      .catch(() => newSession());
+    const response = await fetch(`/api/history/${encodeURIComponent(saved)}`).catch(() => null);
+    const msgs = response?.ok ? await response.json() : [];
+    if (msgs.length) await loadSession(saved);
+    else newSession();
   } else {
     newSession();
   }
@@ -650,11 +697,14 @@ function loadSessions() {
         const meta = s.msg_count != null
           ? `${d.getMonth()+1}/${d.getDate()} · ${s.msg_count} 則訊息`
           : `${d.getMonth()+1}/${d.getDate()} · ${s.hit_count||0} 個命中`;
+        const agentLabel = s.agent_id && agentsById[s.agent_id]
+          ? `${agentsById[s.agent_id].label} · `
+          : '';
         el.innerHTML = `
           <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:8px;">
             <div style="flex:1; cursor:pointer; min-width:0;" class="sess-click">
               <div class="sess-first">${escHtml(displayTitle)}</div>
-              <div class="sess-meta">${meta}</div>
+              <div class="sess-meta">${escHtml(agentLabel + meta)}</div>
               ${snippet}
             </div>
             <div style="display:flex; gap:4px;" class="sess-actions">
@@ -730,6 +780,7 @@ async function sendMessage(textOverride) {
   const payload = {
     session_id: sessionId,
     message: text,
+    agent_id: selectedAgentId,
     use_rag: shouldUseRAG(text),
     top_k: parseInt(document.getElementById('filter-topk').value),
     category_filter: document.getElementById('filter-cat').value.trim() || null,

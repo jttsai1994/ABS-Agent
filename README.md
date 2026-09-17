@@ -84,17 +84,22 @@ AI-SUPERNOTES/
 - `CHAT_PROVIDER=foundry_agent`：直接呼叫已發佈的 Foundry Agent（建議用於截圖中的 `abs-sharepoint`）。
 - `CHAT_PROVIDER=rag`：維持原本的 `RAG_BASE_URL` 呼叫流程。
 
-#### 1. 從 Foundry 複製 Agent 資訊
+#### 1. 管理可選 Agent
 
-在 Foundry Agent 頁面選擇 **Call agent → Python**，取得以下三個值：
+在 Foundry Agent 頁面選擇 **Call agent → Python**，取得 Project endpoint、Agent name 與 Version，然後新增到 `chatbot/agents.json`：
 
-| 畫面欄位         | 環境變數                   | 此專案範例                                                                         |
-| ---------------- | -------------------------- | ---------------------------------------------------------------------------------- |
-| Project endpoint | `FOUNDRY_PROJECT_ENDPOINT` | `https://poc-test-foundryiq.services.ai.azure.com/api/projects/poc-test-foundryiq` |
-| Agent name       | `FOUNDRY_AGENT_NAME`       | `abs-sharepoint`                                                                   |
-| Version          | `FOUNDRY_AGENT_VERSION`    | `7`                                                                                |
+```json
+{
+  "id": "foundry-iq",
+  "label": "Foundry IQ",
+  "project_endpoint": "https://poc-test-foundryiq.services.ai.azure.com/api/projects/poc-test-foundryiq",
+  "agent_name": "abs-foundryIQ",
+  "version": "4",
+  "enabled": true
+}
+```
 
-> Agent 必須先 **Publish**。版本更新後，也要同步更新 `FOUNDRY_AGENT_VERSION`。
+`id` 是前後端交換的穩定識別碼；未來更新 Agent 版本只需修改 `version`。Agent 必須先 **Publish**，後端只接受此設定檔內 `enabled=true` 的白名單項目，且不會把 Project endpoint 回傳給瀏覽器。
 
 #### 2. 建立本機設定
 
@@ -108,9 +113,8 @@ Copy-Item chatbot/.env.example chatbot/.env
 
 ```dotenv
 CHAT_PROVIDER=foundry_agent
-FOUNDRY_PROJECT_ENDPOINT=https://poc-test-foundryiq.services.ai.azure.com/api/projects/poc-test-foundryiq
-FOUNDRY_AGENT_NAME=abs-sharepoint
-FOUNDRY_AGENT_VERSION=7
+FOUNDRY_AGENTS_FILE=agents.json
+FOUNDRY_DEFAULT_AGENT_ID=sharepoint
 ```
 
 `.env` 已被 Git 忽略，不要將權杖、Client Secret 或其他秘密提交到版本庫。
@@ -140,26 +144,26 @@ python -m uvicorn chatbot.app:app --host 127.0.0.1 --port 8080
 Invoke-RestMethod http://127.0.0.1:8080/api/health
 ```
 
-預期 `provider` 為 `foundry_agent`、`status` 為 `ok`，且 `missing` 為空陣列。接著直接測試後端：
+預期 `provider` 為 `foundry_agent`、`status` 為 `ok`，且 `agent_count` 大於 0。可透過 `GET /api/agents` 查看前端可選的安全 metadata。接著直接測試指定 Agent：
 
 ```powershell
 Invoke-RestMethod -Uri http://127.0.0.1:8080/api/chat `
     -Method POST `
     -ContentType 'application/json' `
-    -Body (@{ message = '請簡介你可以協助的事項' } | ConvertTo-Json)
+    -Body (@{ message = '請簡介你可以協助的事項'; agent_id = 'foundry-iq' } | ConvertTo-Json)
 ```
 
-最後開啟 <http://127.0.0.1:8080>，即可用既有介面測試 Agent。瀏覽器只連 FastAPI，Azure 身分與 Endpoint 均保留在伺服器端。
+最後開啟 <http://127.0.0.1:8080>，即可從介面上方的 Agent 選單切換。切換時會自動建立新對話；既有對話會記住原本使用的 Agent。瀏覽器只連 FastAPI，Azure 身分與 Endpoint 均保留在伺服器端。
 
 #### 常見 Foundry 連線錯誤
 
 | 狀態／訊息                      | 處理方式                                                                          |
 | ------------------------------- | --------------------------------------------------------------------------------- |
-| `configuration_error`           | 檢查 `.env` 三個 `FOUNDRY_*` 值，修改後重啟服務。                                 |
+| `configuration_error`           | 檢查 `FOUNDRY_AGENTS_FILE`、預設 Agent ID 與 JSON 格式，修改後重啟服務。          |
 | `DefaultAzureCredential failed` | 執行 `az login`；多租戶時指定 tenant。                                            |
 | `401 Unauthorized`              | 登入身分或租戶錯誤，重新登入正確租戶。                                            |
 | `403 Forbidden`                 | 對使用者或 Managed Identity 授予 Project 層級的 Foundry User 角色，等待權限生效。 |
-| 找不到 Agent／版本              | 確認 Agent 已 Publish，名稱與版本必須和 **Call agent** 畫面完全一致。             |
+| 找不到 Agent／版本              | 確認 Agent 已 Publish，並更新 `chatbot/agents.json` 的名稱與版本。                |
 | Endpoint 錯誤                   | 必須使用完整 Project endpoint，包含 `/api/projects/<project-name>`。              |
 
 ### 前置需求

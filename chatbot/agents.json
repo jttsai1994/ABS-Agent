@@ -1,0 +1,20 @@
+{
+  "agents": [
+    {
+      "id": "sharepoint",
+      "label": "SharePoint AI Search",
+      "project_endpoint": "https://poc-test-foundryiq.services.ai.azure.com/api/projects/poc-test-foundryiq",
+      "agent_name": "abs-sharepoint",
+      "version": "9",
+      "enabled": true
+    },
+    {
+      "id": "foundry-iq",
+      "label": "Foundry IQ",
+      "project_endpoint": "https://poc-test-foundryiq.services.ai.azure.com/api/projects/poc-test-foundryiq",
+      "agent_name": "abs-foundryIQ",
+      "version": "4",
+      "enabled": true
+    }
+  ]
+}
