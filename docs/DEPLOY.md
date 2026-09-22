@@ -91,7 +91,8 @@ AZURE_CLIENT_CERTIFICATE_PASSWORD=<由祕密管理系統提供>
 
 - 網站使用者可以使用公司本地帳密登入；不需要 O365 帳號。
 - 後端固定使用 Service Principal 呼叫 Foundry；使用者永遠不接觸 Azure CLI、device code 或 Azure Token。
-- 目前程式尚未實作本地帳密登入、角色或使用者管理。正式開放前必須補上此功能，或在反向代理／既有內網身分系統進行驗證。
+- 後端以 Argon2 保存密碼雜湊、使用 HttpOnly session cookie 與 CSRF token，並支援 `admin`／`user`、群組與 Agent 授權。
+- 第一位管理員由主機的 `BOOTSTRAP_ADMIN_USERNAME` 與 `BOOTSTRAP_ADMIN_PASSWORD` 建立；一般帳號依 `ALLOW_SELF_REGISTRATION` 決定是否可自行註冊。
 
 ### 4.2 授權與資料範圍
 

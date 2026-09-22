@@ -146,7 +146,9 @@ Invoke-RestMethod http://127.0.0.1:8080/api/agents
 - `.env`、`.pfx`、`.pem`、密碼與 Client Secret 不得提交至 Git。
 - 正式環境不要使用個人 Azure CLI 登入；請使用獨立的 Service Principal 憑證。
 - PFX 私鑰僅授權給執行 Uvicorn 的服務帳號讀取。
-- 目前專案只有選用的 `CHATBOT_API_KEY` API 保護；**本地帳密登入、角色與使用者管理尚未實作**。對內網正式開放前，需補上應用程式驗證／授權並以 HTTPS 反向代理公開。
+- 已提供本地帳密登入、Argon2 密碼雜湊、HttpOnly session cookie、CSRF 驗證、`admin`／`user` 角色、群組 Agent 授權、會話擁有者隔離與稽核紀錄。
+- 部署時透過 `BOOTSTRAP_ADMIN_USERNAME` 與 `BOOTSTRAP_ADMIN_PASSWORD` 建立第一位管理員；這兩個值只能放在受保護的主機祕密設定中。
+- 對內網正式開放時仍必須使用 HTTPS 反向代理，並將 `COOKIE_SECURE=true`。
 - Foundry／SharePoint 資料會以後端 Service Principal 的權限存取；應在網站後端另行實作部門、廠區或角色的資料授權規則。
 
 ## 文件

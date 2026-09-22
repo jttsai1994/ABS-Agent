@@ -19,10 +19,12 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import time
 import uuid
@@ -31,9 +33,11 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request, Security
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, Security
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security.api_key import APIKeyHeader
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
@@ -59,7 +63,18 @@ FOUNDRY_DEFAULT_AGENT_ID: str = os.getenv(
 AZURE_TENANT_ID: str = os.getenv("AZURE_TENANT_ID", "").strip()
 DB_PATH: str = os.getenv("CHAT_DB_PATH", str(Path(__file__).parent / "chat.db"))
 CHATBOT_API_KEY: str = os.getenv("CHATBOT_API_KEY", "")
+LOCAL_AUTH_ENABLED: bool = os.getenv("LOCAL_AUTH_ENABLED", "true").strip().lower() == "true"
+ALLOW_SELF_REGISTRATION: bool = (
+    os.getenv("ALLOW_SELF_REGISTRATION", "true").strip().lower() == "true"
+)
+BOOTSTRAP_ADMIN_USERNAME: str = os.getenv("BOOTSTRAP_ADMIN_USERNAME", "").strip()
+BOOTSTRAP_ADMIN_PASSWORD: str = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "")
+AUTH_SESSION_DAYS: int = int(os.getenv("AUTH_SESSION_DAYS", "14"))
 HISTORY_LIMIT: int = 200  # max messages returned per session
+
+SESSION_COOKIE = "abs_session"
+CSRF_HEADER = "X-CSRF-Token"
+password_hasher = PasswordHasher()
 
 # ---------------------------------------------------------------------------
 # Memory / follow-up settings
@@ -86,18 +101,110 @@ _FOLLOWUP_RE = re.compile(
 
 def _init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('admin', 'user')),
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                last_login_at REAL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS groups (
+                group_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                description TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS group_members (
+                group_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY(group_id, user_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS auth_sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                csrf_token TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                created_at REAL NOT NULL,
+                last_seen_at REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT,
+                action TEXT NOT NULL,
+                resource_type TEXT,
+                resource_id TEXT,
+                details TEXT,
+                ip_address TEXT,
+                created_at REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS folders (
+                folder_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                UNIQUE(user_id, name)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tags (
+                tag_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                color TEXT NOT NULL DEFAULT '#64748b',
+                created_at REAL NOT NULL,
+                UNIQUE(user_id, name)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS session_tags (
+                session_id TEXT NOT NULL,
+                tag_id TEXT NOT NULL,
+                PRIMARY KEY(session_id, tag_id)
+            )
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id  TEXT    PRIMARY KEY,
                 title       TEXT    DEFAULT '新對話',
                 agent_id    TEXT,
+                user_id     TEXT,
+                folder_id   TEXT,
+                is_temporary INTEGER NOT NULL DEFAULT 0,
+                is_pinned   INTEGER NOT NULL DEFAULT 0,
+                is_archived INTEGER NOT NULL DEFAULT 0,
+                expires_at  REAL,
                 created_at  REAL    NOT NULL,
                 updated_at  REAL    NOT NULL
             )
         """)
         session_columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
-        if "agent_id" not in session_columns:
-            conn.execute("ALTER TABLE sessions ADD COLUMN agent_id TEXT")
+        for name, definition in (
+            ("agent_id", "TEXT"),
+            ("user_id", "TEXT"),
+            ("folder_id", "TEXT"),
+            ("is_temporary", "INTEGER NOT NULL DEFAULT 0"),
+            ("is_pinned", "INTEGER NOT NULL DEFAULT 0"),
+            ("is_archived", "INTEGER NOT NULL DEFAULT 0"),
+            ("expires_at", "REAL"),
+        ):
+            if name not in session_columns:
+                conn.execute(f"ALTER TABLE sessions ADD COLUMN {name} {definition}")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,6 +218,9 @@ def _init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_session " "ON messages(session_id, created_at)"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, updated_at)"
+        )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS feedback (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,35 +232,185 @@ def _init_db() -> None:
                 UNIQUE(message_id)
             )
         """)
+        if BOOTSTRAP_ADMIN_USERNAME and BOOTSTRAP_ADMIN_PASSWORD:
+            existing_admin = conn.execute(
+                "SELECT 1 FROM users WHERE role='admin' LIMIT 1"
+            ).fetchone()
+            if not existing_admin:
+                now = time.time()
+                conn.execute(
+                    "INSERT INTO users (user_id, username, password_hash, role, created_at, updated_at) VALUES (?, ?, ?, 'admin', ?, ?)",
+                    (
+                        str(uuid.uuid4()),
+                        BOOTSTRAP_ADMIN_USERNAME,
+                        password_hasher.hash(BOOTSTRAP_ADMIN_PASSWORD),
+                        now,
+                        now,
+                    ),
+                )
         conn.commit()
 
 
 _init_db()
 
 
-def _ensure_session(session_id: str, requested_agent_id: str | None) -> str | None:
+def _db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def _audit(
+    action: str,
+    request: Request | None = None,
+    *,
+    user_id: str | None = None,
+    resource_type: str | None = None,
+    resource_id: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    ip_address = request.client.host if request and request.client else None
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO audit_logs (user_id, action, resource_type, resource_id, details, ip_address, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                user_id,
+                action,
+                resource_type,
+                resource_id,
+                json.dumps(details or {}, ensure_ascii=False),
+                ip_address,
+                time.time(),
+            ),
+        )
+
+
+def _user_groups(user_id: str) -> list[str]:
+    with _db() as conn:
+        return [
+            row[0]
+            for row in conn.execute(
+                "SELECT g.name FROM groups g JOIN group_members gm ON gm.group_id=g.group_id WHERE gm.user_id=? ORDER BY g.name",
+                (user_id,),
+            ).fetchall()
+        ]
+
+
+def _public_user(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "user_id": row["user_id"],
+        "username": row["username"],
+        "role": row["role"],
+        "is_active": bool(row["is_active"]),
+        "created_at": row["created_at"],
+        "last_login_at": row["last_login_at"],
+        "groups": _user_groups(row["user_id"]),
+    }
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _create_auth_session(user_id: str) -> tuple[str, str]:
+    token, csrf_token = secrets.token_urlsafe(48), secrets.token_urlsafe(32)
+    now = time.time()
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO auth_sessions (token_hash, user_id, csrf_token, expires_at, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (_token_hash(token), user_id, csrf_token, now + AUTH_SESSION_DAYS * 86400, now, now),
+        )
+    return token, csrf_token
+
+
+def _get_current_user(request: Request) -> dict[str, Any]:
+    if not LOCAL_AUTH_ENABLED:
+        return {"user_id": "legacy", "username": "legacy", "role": "admin", "groups": []}
+    token = request.cookies.get(SESSION_COOKIE)
+    if not token:
+        raise HTTPException(status_code=401, detail="請先登入")
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT u.*, s.csrf_token, s.expires_at FROM auth_sessions s JOIN users u ON u.user_id=s.user_id WHERE s.token_hash=?",
+            (_token_hash(token),),
+        ).fetchone()
+        if not row or not row["is_active"] or row["expires_at"] < time.time():
+            conn.execute("DELETE FROM auth_sessions WHERE token_hash=?", (_token_hash(token),))
+            raise HTTPException(status_code=401, detail="登入已失效，請重新登入")
+        conn.execute(
+            "UPDATE auth_sessions SET last_seen_at=? WHERE token_hash=?",
+            (time.time(), _token_hash(token)),
+        )
+    user = _public_user(row)
+    user["csrf_token"] = row["csrf_token"]
+    return user
+
+
+def _require_csrf(request: Request, user: dict[str, Any]) -> None:
+    if LOCAL_AUTH_ENABLED and not secrets.compare_digest(
+        request.headers.get(CSRF_HEADER, ""), user.get("csrf_token", "")
+    ):
+        raise HTTPException(status_code=403, detail="無效的 CSRF token")
+
+
+def _require_admin(user: dict[str, Any] = Depends(_get_current_user)) -> dict[str, Any]:
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="需要管理員權限")
+    return user
+
+
+def _agent_allowed(agent: dict[str, str], user: dict[str, Any]) -> bool:
+    allowed_roles = agent.get("allowed_roles", [])
+    allowed_groups = agent.get("allowed_groups", [])
+    return user["role"] == "admin" or (
+        (not allowed_roles or user["role"] in allowed_roles)
+        and (not allowed_groups or bool(set(user["groups"]) & set(allowed_groups)))
+    )
+
+
+def _ensure_session(
+    session_id: str,
+    requested_agent_id: str | None,
+    user: dict[str, Any],
+    *,
+    temporary: bool = False,
+) -> str | None:
     """Create a session or enforce its existing Agent binding."""
     selected_agent_id: str | None = None
     if CHAT_PROVIDER == "foundry_agent":
-        selected_agent_id = _get_foundry_agent(requested_agent_id)["id"]
+        agent = _get_foundry_agent(requested_agent_id)
+        if not _agent_allowed(agent, user):
+            raise HTTPException(status_code=403, detail="您沒有使用此 Agent 的權限")
+        selected_agent_id = agent["id"]
 
     now = time.time()
     with sqlite3.connect(DB_PATH) as conn:
         existing = conn.execute(
-            "SELECT agent_id FROM sessions WHERE session_id = ?",
+            "SELECT agent_id, user_id FROM sessions WHERE session_id = ?",
             (session_id,),
         ).fetchone()
         if not existing:
             conn.execute(
                 "INSERT INTO sessions "
-                "(session_id, title, agent_id, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (session_id, "新對話", selected_agent_id, now, now),
+                "(session_id, title, agent_id, user_id, is_temporary, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    "新對話",
+                    selected_agent_id,
+                    user["user_id"],
+                    int(temporary),
+                    now,
+                    now,
+                ),
             )
             conn.commit()
             return selected_agent_id
 
-        stored_agent_id = existing[0]
+        stored_agent_id, owner_id = existing
+        if (not owner_id or owner_id != user["user_id"]) and user["role"] != "admin":
+            raise HTTPException(status_code=404, detail="找不到對話")
         if CHAT_PROVIDER != "foundry_agent":
             return None
         if not stored_agent_id:
@@ -201,7 +461,7 @@ def _is_followup(message: str, history: list[dict]) -> bool:
     return False
 
 
-def _load_foundry_agents() -> dict[str, dict[str, str]]:
+def _load_foundry_agents() -> dict[str, dict[str, Any]]:
     """Load and validate the server-side Foundry Agent allowlist."""
     if CHAT_PROVIDER != "foundry_agent":
         return {}
@@ -214,7 +474,7 @@ def _load_foundry_agents() -> dict[str, dict[str, str]]:
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"無法讀取 Foundry Agent 設定檔：{config_path}") from exc
 
-    agents: dict[str, dict[str, str]] = {}
+    agents: dict[str, dict[str, Any]] = {}
     for item in raw.get("agents", []):
         if not item.get("enabled", True):
             continue
@@ -230,12 +490,24 @@ def _load_foundry_agents() -> dict[str, dict[str, str]]:
         endpoint = str(item["project_endpoint"]).strip().rstrip("/")
         if not endpoint.startswith("https://") or "/api/projects/" not in endpoint:
             raise RuntimeError(f"Agent Project Endpoint 格式無效：{agent_id}")
+        allowed_roles = item.get("allowed_roles", [])
+        allowed_groups = item.get("allowed_groups", [])
+        if not isinstance(allowed_roles, list) or not all(
+            role in ("admin", "user") for role in allowed_roles
+        ):
+            raise RuntimeError(f"Agent allowed_roles 格式無效：{agent_id}")
+        if not isinstance(allowed_groups, list) or not all(
+            isinstance(group, str) and group.strip() for group in allowed_groups
+        ):
+            raise RuntimeError(f"Agent allowed_groups 格式無效：{agent_id}")
         agents[agent_id] = {
             "id": agent_id,
             "label": str(item["label"]).strip(),
             "project_endpoint": endpoint,
             "agent_name": str(item["agent_name"]).strip(),
             "version": str(item["version"]).strip(),
+            "allowed_roles": allowed_roles,
+            "allowed_groups": [group.strip() for group in allowed_groups],
         }
 
     if not agents:
@@ -248,7 +520,7 @@ def _load_foundry_agents() -> dict[str, dict[str, str]]:
 FOUNDRY_AGENTS = _load_foundry_agents()
 
 
-def _get_foundry_agent(agent_id: str | None) -> dict[str, str]:
+def _get_foundry_agent(agent_id: str | None) -> dict[str, Any]:
     """Resolve a requested ID against the allowlist without exposing endpoints."""
     selected_id = (agent_id or FOUNDRY_DEFAULT_AGENT_ID).strip()
     agent = FOUNDRY_AGENTS.get(selected_id)
@@ -468,8 +740,13 @@ def _save(
     return int(msg_id or 0)
 
 
-def _get_history(session_id: str) -> list[dict[str, Any]]:
+def _get_history(session_id: str, user: dict[str, Any]) -> list[dict[str, Any]]:
     with sqlite3.connect(DB_PATH) as conn:
+        owner = conn.execute(
+            "SELECT user_id FROM sessions WHERE session_id=?", (session_id,)
+        ).fetchone()
+        if not owner or ((not owner[0] or owner[0] != user["user_id"]) and user["role"] != "admin"):
+            raise HTTPException(status_code=404, detail="找不到對話")
         rows = conn.execute(
             "SELECT m.id, m.role, m.content, m.sources, m.created_at, f.rating "
             "FROM messages m LEFT JOIN feedback f ON f.message_id = m.id "
@@ -490,7 +767,9 @@ def _get_history(session_id: str) -> list[dict[str, Any]]:
     ]
 
 
-def _list_sessions(limit: int = 50) -> list[dict[str, Any]]:
+def _list_sessions(
+    user: dict[str, Any], limit: int = 50, *, archived: bool = False
+) -> list[dict[str, Any]]:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
             """
@@ -501,14 +780,18 @@ def _list_sessions(limit: int = 50) -> list[dict[str, Any]]:
                      s.agent_id,
                    MIN(m.content)      AS first_msg,
                    MAX(m.created_at)   AS last_at,
-                   COUNT(m.id)         AS msg_count
+                     COUNT(m.id)         AS msg_count,
+                     s.is_pinned, s.is_archived, s.is_temporary, s.folder_id,
+                       (SELECT f.name FROM folders f WHERE f.folder_id=s.folder_id) AS folder_name,
+                       (SELECT GROUP_CONCAT(t.name, '|') FROM tags t JOIN session_tags st ON st.tag_id=t.tag_id WHERE st.session_id=s.session_id) AS tag_names
             FROM   sessions s
             LEFT   JOIN messages m ON s.session_id = m.session_id AND m.role = 'user'
+                 WHERE  s.user_id = ? AND s.is_archived = ? AND s.is_temporary = 0
             GROUP  BY s.session_id
-            ORDER  BY s.updated_at DESC
+                 ORDER  BY s.is_pinned DESC, s.updated_at DESC
             LIMIT  ?
             """,
-            (limit,),
+            (user["user_id"], int(archived), limit),
         ).fetchall()
     result = []
     for r in rows:
@@ -525,6 +808,12 @@ def _list_sessions(limit: int = 50) -> list[dict[str, Any]]:
                 "first_msg": preview,
                 "last_at": r[6],
                 "msg_count": r[7],
+                "is_pinned": bool(r[8]),
+                "is_archived": bool(r[9]),
+                "is_temporary": bool(r[10]),
+                "folder_id": r[11],
+                "folder_name": r[12],
+                "tags": (r[13] or "").split("|") if r[13] else [],
             }
         )
     return result
@@ -558,6 +847,7 @@ class ChatRequest(BaseModel):
     category_filter: str | None = None
     date_from: str | None = None
     date_to: str | None = None
+    temporary: bool = False
 
 
 class ChatResponse(BaseModel):
@@ -566,15 +856,131 @@ class ChatResponse(BaseModel):
     sources: list[dict[str, Any]]
 
 
+class CredentialsRequest(BaseModel):
+    username: str
+    password: str
+    confirm_password: str | None = None
+
+
+def _validate_credentials(
+    req: CredentialsRequest, *, require_confirmation: bool = False
+) -> tuple[str, str]:
+    username = req.username.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{3,50}", username):
+        raise HTTPException(status_code=400, detail="帳號需為 3 至 50 個英數、底線、點或連字號")
+    if len(req.password) < 12 or len(req.password) > 256:
+        raise HTTPException(status_code=400, detail="密碼長度需介於 12 至 256 字元")
+    if require_confirmation and req.confirm_password != req.password:
+        raise HTTPException(status_code=400, detail="兩次輸入的密碼不一致")
+    return username, req.password
+
+
+def _login_response(response: Response, user_id: str) -> dict[str, Any]:
+    token, csrf_token = _create_auth_session(user_id)
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        max_age=AUTH_SESSION_DAYS * 86400,
+        httponly=True,
+        secure=os.getenv("COOKIE_SECURE", "false").lower() == "true",
+        samesite="lax",
+        path="/",
+    )
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+    return {"user": _public_user(row), "csrf_token": csrf_token}
+
+
+# ---------------------------------------------------------------------------
+# Local authentication
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/auth/register")
+def register(req: CredentialsRequest, request: Request, response: Response):
+    if not LOCAL_AUTH_ENABLED:
+        raise HTTPException(status_code=404, detail="本地登入未啟用")
+    if not ALLOW_SELF_REGISTRATION:
+        raise HTTPException(status_code=403, detail="目前未開放自行註冊")
+    username, password = _validate_credentials(req, require_confirmation=True)
+    now, user_id = time.time(), str(uuid.uuid4())
+    try:
+        with _db() as conn:
+            conn.execute(
+                "INSERT INTO users (user_id, username, password_hash, role, created_at, updated_at) VALUES (?, ?, ?, 'user', ?, ?)",
+                (user_id, username, password_hasher.hash(password), now, now),
+            )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="此帳號已被使用") from exc
+    _audit("auth.register", request, user_id=user_id, resource_type="user", resource_id=user_id)
+    return _login_response(response, user_id)
+
+
+@app.post("/api/auth/login")
+def login(req: CredentialsRequest, request: Request, response: Response):
+    username, password = _validate_credentials(req)
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        valid = False
+        if row and row["is_active"]:
+            try:
+                valid = password_hasher.verify(row["password_hash"], password)
+            except (VerifyMismatchError, VerificationError, InvalidHashError):
+                valid = False
+            if valid:
+                conn.execute(
+                    "UPDATE users SET last_login_at=?, updated_at=? WHERE user_id=?",
+                    (time.time(), time.time(), row["user_id"]),
+                )
+        if not valid:
+            _audit(
+                "auth.login_failed", request, resource_type="user", details={"username": username}
+            )
+            raise HTTPException(status_code=401, detail="帳號或密碼錯誤")
+    _audit(
+        "auth.login",
+        request,
+        user_id=row["user_id"],
+        resource_type="user",
+        resource_id=row["user_id"],
+    )
+    return _login_response(response, row["user_id"])
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request, response: Response, user: dict[str, Any] = Depends(_get_current_user)):
+    _require_csrf(request, user)
+    token = request.cookies.get(SESSION_COOKIE, "")
+    with _db() as conn:
+        conn.execute("DELETE FROM auth_sessions WHERE token_hash=?", (_token_hash(token),))
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    _audit("auth.logout", request, user_id=user["user_id"])
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def me(user: dict[str, Any] = Depends(_get_current_user)):
+    return {
+        "user": {key: value for key, value in user.items() if key != "csrf_token"},
+        "csrf_token": user.get("csrf_token"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # API routes
 # ---------------------------------------------------------------------------
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest, _: None = Security(_check_key)) -> ChatResponse:
+async def chat(
+    req: ChatRequest,
+    request: Request,
+    _: None = Security(_check_key),
+    user: dict[str, Any] = Depends(_get_current_user),
+) -> ChatResponse:
+    _require_csrf(request, user)
     session_id = (req.session_id or "").strip() or str(uuid.uuid4())
-    agent_id = _ensure_session(session_id, req.agent_id)
+    agent_id = _ensure_session(session_id, req.agent_id, user, temporary=req.temporary)
 
     # 建立歷史記憶（在儲存本次訊息之前）
     history = _build_context_history(session_id)
@@ -604,10 +1010,16 @@ async def chat(req: ChatRequest, _: None = Security(_check_key)) -> ChatResponse
 
 
 @app.post("/api/chat/stream")
-async def chat_stream(req: ChatRequest, _: None = Security(_check_key)):
+async def chat_stream(
+    req: ChatRequest,
+    request: Request,
+    _: None = Security(_check_key),
+    user: dict[str, Any] = Depends(_get_current_user),
+):
     """Streaming version of /api/chat — proxies SSE from RAG /query/stream or /chat/stream."""
+    _require_csrf(request, user)
     session_id = (req.session_id or "").strip() or str(uuid.uuid4())
-    agent_id = _ensure_session(session_id, req.agent_id)
+    agent_id = _ensure_session(session_id, req.agent_id, user, temporary=req.temporary)
 
     # 建立歷史記憶（在儲存本次訊息之前）
     history = _build_context_history(session_id)
@@ -736,26 +1148,52 @@ async def chat_stream(req: ChatRequest, _: None = Security(_check_key)):
 
 
 @app.get("/api/history/{session_id}")
-def get_history(session_id: str, _: None = Security(_check_key)):
-    return _get_history(session_id)
+def get_history(
+    session_id: str,
+    _: None = Security(_check_key),
+    user: dict[str, Any] = Depends(_get_current_user),
+):
+    return _get_history(session_id, user)
 
 
 @app.delete("/api/history/{session_id}")
-def delete_history(session_id: str, _: None = Security(_check_key)):
+def delete_history(
+    session_id: str,
+    request: Request,
+    _: None = Security(_check_key),
+    user: dict[str, Any] = Depends(_get_current_user),
+):
+    _require_csrf(request, user)
     with sqlite3.connect(DB_PATH) as conn:
+        owner = conn.execute(
+            "SELECT user_id FROM sessions WHERE session_id=?", (session_id,)
+        ).fetchone()
+        if not owner or ((not owner[0] or owner[0] != user["user_id"]) and user["role"] != "admin"):
+            raise HTTPException(status_code=404, detail="找不到對話")
         conn.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
         conn.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
         conn.commit()
+    _audit(
+        "session.delete",
+        request,
+        user_id=user["user_id"],
+        resource_type="session",
+        resource_id=session_id,
+    )
     return {"ok": True}
 
 
 @app.get("/api/sessions")
-def get_sessions(_: None = Security(_check_key)):
-    return _list_sessions()
+def get_sessions(
+    archived: bool = False,
+    _: None = Security(_check_key),
+    user: dict[str, Any] = Depends(_get_current_user),
+):
+    return _list_sessions(user, archived=archived)
 
 
 @app.get("/api/agents")
-def get_agents(_: None = Security(_check_key)):
+def get_agents(_: None = Security(_check_key), user: dict[str, Any] = Depends(_get_current_user)):
     """Return safe public metadata; project endpoints remain server-side."""
     return {
         "default_agent_id": FOUNDRY_DEFAULT_AGENT_ID,
@@ -767,6 +1205,7 @@ def get_agents(_: None = Security(_check_key)):
                 "version": agent["version"],
             }
             for agent in FOUNDRY_AGENTS.values()
+            if _agent_allowed(agent, user)
         ],
     }
 
@@ -789,14 +1228,23 @@ def health(_: None = Security(_check_key)):
 
 
 @app.put("/api/sessions/{session_id}")
-def rename_session(session_id: str, title: str = Query(...), _: None = Security(_check_key)):
+def rename_session(
+    session_id: str,
+    request: Request,
+    title: str = Query(...),
+    _: None = Security(_check_key),
+    user: dict[str, Any] = Depends(_get_current_user),
+):
     """更新會話標題。"""
     title = (title or "").strip() or "新對話"
+    _require_csrf(request, user)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "UPDATE sessions SET title = ?, updated_at = ? WHERE session_id = ?",
-            (title, time.time(), session_id),
+            "UPDATE sessions SET title = ?, updated_at = ? WHERE session_id = ? AND user_id = ?",
+            (title, time.time(), session_id, user["user_id"]),
         )
+        if not conn.total_changes:
+            raise HTTPException(status_code=404, detail="找不到對話")
         conn.commit()
     return {"ok": True, "title": title}
 
@@ -836,7 +1284,13 @@ class FeedbackRequest(BaseModel):
 
 
 @app.post("/api/feedback")
-def submit_feedback(req: FeedbackRequest, _: None = Security(_check_key)):
+def submit_feedback(
+    req: FeedbackRequest,
+    request: Request,
+    _: None = Security(_check_key),
+    user: dict[str, Any] = Depends(_get_current_user),
+):
+    _require_csrf(request, user)
     if req.rating not in (-1, 0, 1):
         raise HTTPException(status_code=400, detail="rating must be -1, 0 or 1")
     with sqlite3.connect(DB_PATH) as conn:
@@ -845,16 +1299,27 @@ def submit_feedback(req: FeedbackRequest, _: None = Security(_check_key)):
         else:
             conn.execute(
                 "INSERT INTO feedback (session_id, message_id, rating, comment, created_at) "
-                "SELECT session_id, ?, ?, ?, ? FROM messages WHERE id=? "
+                "SELECT m.session_id, ?, ?, ?, ? FROM messages m JOIN sessions s ON s.session_id=m.session_id WHERE m.id=? AND s.user_id=? "
                 "ON CONFLICT(message_id) DO UPDATE SET rating=excluded.rating, comment=excluded.comment",
-                (req.message_id, req.rating, req.comment, time.time(), req.message_id),
+                (
+                    req.message_id,
+                    req.rating,
+                    req.comment,
+                    time.time(),
+                    req.message_id,
+                    user["user_id"],
+                ),
             )
         conn.commit()
     return {"ok": True, "rating": req.rating}
 
 
 @app.get("/api/sessions/search")
-def search_sessions(q: str = Query(..., min_length=1), _: None = Security(_check_key)):
+def search_sessions(
+    q: str = Query(..., min_length=1),
+    _: None = Security(_check_key),
+    user: dict[str, Any] = Depends(_get_current_user),
+):
     """搜尋對話：同時比對 session 標題與 message 內容。"""
     like = f"%{q}%"
     with sqlite3.connect(DB_PATH) as conn:
@@ -867,14 +1332,14 @@ def search_sessions(q: str = Query(..., min_length=1), _: None = Security(_check
                    (SELECT COUNT(*) FROM messages
                     WHERE session_id=s.session_id AND content LIKE ?) AS hit_count
             FROM sessions s
-            WHERE s.title LIKE ? OR EXISTS (
+            WHERE s.user_id = ? AND s.is_temporary = 0 AND (s.title LIKE ? OR EXISTS (
                 SELECT 1 FROM messages m
                 WHERE m.session_id = s.session_id AND m.content LIKE ?
-            )
+            ))
             ORDER BY s.updated_at DESC
             LIMIT 30
             """,
-            (like, like, like, like),
+            (like, like, user["user_id"], like, like),
         ).fetchall()
     results = []
     for sid, title, updated_at, agent_id, hit, hit_count in rows:
@@ -897,9 +1362,15 @@ def search_sessions(q: str = Query(..., min_length=1), _: None = Security(_check
 
 
 @app.post("/api/sessions/{session_id}/auto-title")
-async def auto_title(session_id: str, _: None = Security(_check_key)):
+async def auto_title(
+    session_id: str,
+    request: Request,
+    _: None = Security(_check_key),
+    user: dict[str, Any] = Depends(_get_current_user),
+):
     """根據前兩則訊息請 LLM 生成 10 字內標題。"""
-    msgs = _get_history(session_id)
+    _require_csrf(request, user)
+    msgs = _get_history(session_id, user)
     if len(msgs) < 2:
         raise HTTPException(status_code=400, detail="尚無足夠對話可生成標題")
     user_msg = next((m["content"] for m in msgs if m["role"] == "user"), "")[:400]
@@ -911,8 +1382,8 @@ async def auto_title(session_id: str, _: None = Security(_check_key)):
     )
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT agent_id FROM sessions WHERE session_id = ?",
-            (session_id,),
+            "SELECT agent_id FROM sessions WHERE session_id = ? AND user_id = ?",
+            (session_id, user["user_id"]),
         ).fetchone()
     agent_id = row[0] if row else None
     try:
@@ -930,11 +1401,337 @@ async def auto_title(session_id: str, _: None = Security(_check_key)):
 
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "UPDATE sessions SET title = ?, updated_at = ? WHERE session_id = ?",
-            (title, time.time(), session_id),
+            "UPDATE sessions SET title = ?, updated_at = ? WHERE session_id = ? AND user_id = ?",
+            (title, time.time(), session_id, user["user_id"]),
         )
         conn.commit()
     return {"ok": True, "title": title}
+
+
+# ---------------------------------------------------------------------------
+# Workspace organisation and administration
+# ---------------------------------------------------------------------------
+
+
+class NameRequest(BaseModel):
+    name: str
+
+
+class TagRequest(NameRequest):
+    color: str = "#64748b"
+
+
+class UserUpdateRequest(BaseModel):
+    role: str | None = None
+    is_active: bool | None = None
+    group_ids: list[str] | None = None
+
+
+def _owned_session(session_id: str, user: dict[str, Any]) -> None:
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT user_id FROM sessions WHERE session_id=?", (session_id,)
+        ).fetchone()
+    if not row or (
+        (not row["user_id"] or row["user_id"] != user["user_id"]) and user["role"] != "admin"
+    ):
+        raise HTTPException(status_code=404, detail="找不到對話")
+
+
+@app.get("/api/workspace/folders")
+def list_folders(_: None = Security(_check_key), user: dict[str, Any] = Depends(_get_current_user)):
+    with _db() as conn:
+        return [
+            dict(row)
+            for row in conn.execute(
+                "SELECT folder_id, name, created_at FROM folders WHERE user_id=? ORDER BY name",
+                (user["user_id"],),
+            )
+        ]
+
+
+@app.post("/api/workspace/folders")
+def create_folder(
+    req: NameRequest,
+    request: Request,
+    _: None = Security(_check_key),
+    user: dict[str, Any] = Depends(_get_current_user),
+):
+    _require_csrf(request, user)
+    name = req.name.strip()[:50]
+    if not name:
+        raise HTTPException(status_code=400, detail="資料夾名稱不可空白")
+    folder_id = str(uuid.uuid4())
+    try:
+        with _db() as conn:
+            conn.execute(
+                "INSERT INTO folders (folder_id, user_id, name, created_at) VALUES (?, ?, ?, ?)",
+                (folder_id, user["user_id"], name, time.time()),
+            )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="已有同名資料夾") from exc
+    return {"folder_id": folder_id, "name": name}
+
+
+@app.get("/api/workspace/tags")
+def list_tags(_: None = Security(_check_key), user: dict[str, Any] = Depends(_get_current_user)):
+    with _db() as conn:
+        return [
+            dict(row)
+            for row in conn.execute(
+                "SELECT tag_id, name, color, created_at FROM tags WHERE user_id=? ORDER BY name",
+                (user["user_id"],),
+            )
+        ]
+
+
+@app.post("/api/workspace/tags")
+def create_tag(
+    req: TagRequest,
+    request: Request,
+    _: None = Security(_check_key),
+    user: dict[str, Any] = Depends(_get_current_user),
+):
+    _require_csrf(request, user)
+    name, color = req.name.strip()[:30], req.color.strip()
+    if not name or not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+        raise HTTPException(status_code=400, detail="標籤名稱或色彩格式無效")
+    tag_id = str(uuid.uuid4())
+    try:
+        with _db() as conn:
+            conn.execute(
+                "INSERT INTO tags (tag_id, user_id, name, color, created_at) VALUES (?, ?, ?, ?, ?)",
+                (tag_id, user["user_id"], name, color, time.time()),
+            )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="已有同名標籤") from exc
+    return {"tag_id": tag_id, "name": name, "color": color}
+
+
+@app.put("/api/sessions/{session_id}/state")
+def update_session_state(
+    session_id: str,
+    request: Request,
+    pinned: bool | None = None,
+    archived: bool | None = None,
+    folder_id: str | None = None,
+    _: None = Security(_check_key),
+    user: dict[str, Any] = Depends(_get_current_user),
+):
+    _require_csrf(request, user)
+    _owned_session(session_id, user)
+    updates, values = [], []
+    if pinned is not None:
+        updates.extend(["is_pinned=?"])
+        values.append(int(pinned))
+    if archived is not None:
+        updates.extend(["is_archived=?"])
+        values.append(int(archived))
+    if folder_id is not None:
+        with _db() as conn:
+            if (
+                folder_id
+                and not conn.execute(
+                    "SELECT 1 FROM folders WHERE folder_id=? AND user_id=?",
+                    (folder_id, user["user_id"]),
+                ).fetchone()
+            ):
+                raise HTTPException(status_code=400, detail="資料夾不存在")
+        updates.extend(["folder_id=?"])
+        values.append(folder_id or None)
+    if not updates:
+        raise HTTPException(status_code=400, detail="沒有可更新的狀態")
+    values.extend([time.time(), session_id])
+    with _db() as conn:
+        conn.execute(
+            f"UPDATE sessions SET {', '.join(updates)}, updated_at=? WHERE session_id=?", values
+        )
+    return {"ok": True}
+
+
+@app.put("/api/sessions/{session_id}/tags")
+def update_session_tags(
+    session_id: str,
+    tag_ids: list[str],
+    request: Request,
+    _: None = Security(_check_key),
+    user: dict[str, Any] = Depends(_get_current_user),
+):
+    _require_csrf(request, user)
+    _owned_session(session_id, user)
+    with _db() as conn:
+        valid_ids = {
+            row[0]
+            for row in conn.execute(
+                f"SELECT tag_id FROM tags WHERE user_id=? AND tag_id IN ({','.join('?' for _ in tag_ids) or 'NULL'})",
+                (user["user_id"], *tag_ids),
+            )
+        }
+        if valid_ids != set(tag_ids):
+            raise HTTPException(status_code=400, detail="包含無效標籤")
+        conn.execute("DELETE FROM session_tags WHERE session_id=?", (session_id,))
+        conn.executemany(
+            "INSERT INTO session_tags (session_id, tag_id) VALUES (?, ?)",
+            [(session_id, tag_id) for tag_id in tag_ids],
+        )
+    return {"ok": True}
+
+
+@app.get("/api/admin/users")
+def admin_users(_: dict[str, Any] = Depends(_require_admin)):
+    with _db() as conn:
+        rows = conn.execute("SELECT * FROM users ORDER BY created_at DESC").fetchall()
+    return [_public_user(row) for row in rows]
+
+
+@app.get("/api/admin/groups")
+def admin_groups(_: dict[str, Any] = Depends(_require_admin)):
+    with _db() as conn:
+        return [
+            dict(row)
+            for row in conn.execute(
+                "SELECT g.group_id, g.name, g.description, g.created_at, COUNT(gm.user_id) AS member_count FROM groups g LEFT JOIN group_members gm ON gm.group_id=g.group_id GROUP BY g.group_id ORDER BY g.name"
+            )
+        ]
+
+
+@app.post("/api/admin/groups")
+def admin_create_group(
+    req: NameRequest, request: Request, admin: dict[str, Any] = Depends(_require_admin)
+):
+    _require_csrf(request, admin)
+    name = req.name.strip()[:50]
+    if not name:
+        raise HTTPException(status_code=400, detail="群組名稱不可空白")
+    group_id = str(uuid.uuid4())
+    try:
+        with _db() as conn:
+            conn.execute(
+                "INSERT INTO groups (group_id, name, created_at) VALUES (?, ?, ?)",
+                (group_id, name, time.time()),
+            )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="已有同名群組") from exc
+    _audit(
+        "group.create",
+        request,
+        user_id=admin["user_id"],
+        resource_type="group",
+        resource_id=group_id,
+    )
+    return {"group_id": group_id, "name": name}
+
+
+@app.put("/api/admin/users/{user_id}")
+def admin_update_user(
+    user_id: str,
+    req: UserUpdateRequest,
+    request: Request,
+    admin: dict[str, Any] = Depends(_require_admin),
+):
+    _require_csrf(request, admin)
+    if req.role is not None and req.role not in ("admin", "user"):
+        raise HTTPException(status_code=400, detail="無效角色")
+    with _db() as conn:
+        if not conn.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="找不到使用者")
+        if req.role is not None:
+            conn.execute(
+                "UPDATE users SET role=?, updated_at=? WHERE user_id=?",
+                (req.role, time.time(), user_id),
+            )
+        if req.is_active is not None:
+            conn.execute(
+                "UPDATE users SET is_active=?, updated_at=? WHERE user_id=?",
+                (int(req.is_active), time.time(), user_id),
+            )
+        if req.group_ids is not None:
+            conn.execute("DELETE FROM group_members WHERE user_id=?", (user_id,))
+            for group_id in req.group_ids:
+                if conn.execute("SELECT 1 FROM groups WHERE group_id=?", (group_id,)).fetchone():
+                    conn.execute(
+                        "INSERT INTO group_members (group_id, user_id, created_at) VALUES (?, ?, ?)",
+                        (group_id, user_id, time.time()),
+                    )
+    _audit(
+        "user.update", request, user_id=admin["user_id"], resource_type="user", resource_id=user_id
+    )
+    return {"ok": True}
+
+
+@app.delete("/api/admin/users/{user_id}")
+def admin_delete_user(
+    user_id: str,
+    request: Request,
+    admin: dict[str, Any] = Depends(_require_admin),
+):
+    """刪除使用者及其所有相關資料（對話、訊息、反饋等）。"""
+    _require_csrf(request, admin)
+    if user_id == admin["user_id"]:
+        raise HTTPException(status_code=400, detail="無法刪除自己")
+    with _db() as conn:
+        if not conn.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="找不到使用者")
+        # 刪除使用者相關的所有資料
+        session_ids = [
+            row[0]
+            for row in conn.execute(
+                "SELECT session_id FROM sessions WHERE user_id=?", (user_id,)
+            ).fetchall()
+        ]
+        for sid in session_ids:
+            conn.execute("DELETE FROM feedback WHERE session_id=?", (sid,))
+            conn.execute("DELETE FROM messages WHERE session_id=?", (sid,))
+            conn.execute("DELETE FROM session_tags WHERE session_id=?", (sid,))
+        conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM group_members WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM folders WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM tags WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+        conn.commit()
+    _audit(
+        "user.delete", request, user_id=admin["user_id"], resource_type="user", resource_id=user_id
+    )
+    return {"ok": True}
+
+
+@app.get("/api/admin/analytics")
+def admin_analytics(_: dict[str, Any] = Depends(_require_admin)):
+    since = time.time() - 30 * 86400
+    with _db() as conn:
+        return {
+            "users": conn.execute("SELECT COUNT(*) FROM users WHERE is_active=1").fetchone()[0],
+            "sessions_30d": conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE created_at>=?", (since,)
+            ).fetchone()[0],
+            "messages_30d": conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE created_at>=?", (since,)
+            ).fetchone()[0],
+            "feedback": dict(
+                conn.execute(
+                    "SELECT COALESCE(SUM(rating=1),0) AS positive, COALESCE(SUM(rating=-1),0) AS negative FROM feedback"
+                ).fetchone()
+            ),
+            "agents": [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT agent_id, COUNT(*) AS session_count FROM sessions WHERE created_at>=? GROUP BY agent_id ORDER BY session_count DESC",
+                    (since,),
+                )
+            ],
+        }
+
+
+@app.get("/api/admin/audit")
+def admin_audit(limit: int = Query(100, ge=1, le=500), _: dict[str, Any] = Depends(_require_admin)):
+    with _db() as conn:
+        return [
+            dict(row)
+            for row in conn.execute(
+                "SELECT a.*, u.username FROM audit_logs a LEFT JOIN users u ON u.user_id=a.user_id ORDER BY a.created_at DESC LIMIT ?",
+                (limit,),
+            )
+        ]
 
 
 # ---------------------------------------------------------------------------
