@@ -1,276 +1,133 @@
-# AI-SUPERNOTES RAG 系統部署指南
+# ABS Agent 部署設計
 
-本文件分為兩個對象：
+本文件提供架構師、Azure／Entra 管理員與維運人員部署目前 **Foundry Agent 版** ABS Agent 的設計依據。
 
-- **[Part A]** 給架構師：Docker 容器規格需求
-- **[Part B]** 給開發者：程式碼部署、資料向量化、日常操作
+> 本文件不適用於舊版 Qdrant、BM25、RAG API 或 MCP 服務。這些元件不在目前網站的請求路徑上。
 
----
+## 1. 目標架構
 
-## 架構說明
-
-```
-┌─────────────────────────── VM ───────────────────────────┐
-│                                                           │
-│   [由維運同事建立的 Docker 環境]                           │
-│   ┌──────────────────┐   ┌──────────────────────────┐    │
-│   │  容器: qdrant    │   │  容器: api (FastAPI)      │    │
-│   │  port 6333/6334  │◄──│  port 8000               │    │
-│   │  volume 持久化   │   │  POST /query             │    │
-│   │                  │   │  GET  /health            │    │
-│   └──────────────────┘   └──────────┬───────────────┘    │
-│                                     │                     │
-└─────────────────────────────────────┼─────────────────────┘
-                                      │ HTTPS
-                              Azure AI Foundry
-                          (embedding + LLM endpoint)
-```
-
-- **qdrant**：向量資料庫，資料持久化在 VM 磁碟，容器重啟不遺失資料。
-- **api**：FastAPI RAG 服務，收到問題後混合檢索，再呼叫 Foundry LLM 回答。
-- 兩個容器需能互相連線（同一 Docker network），重啟策略設為 `unless-stopped`。
-
----
-
-# Part A｜Docker 容器規格
-
-> **給架構師** 請依照以下規格建立容器環境，完成後告知開發者容器的 IP/hostname 即可。
-
----
-
-## A-1. VM 規格需求
-
-| 項目 | 最低需求                             | 建議             |
-| ---- | ------------------------------------ | ---------------- |
-| OS   | Ubuntu 22.04 / RHEL 8+               | Ubuntu 22.04 LTS |
-| CPU  | 2 vCPU                               | 4 vCPU           |
-| RAM  | 4 GB                                 | 8 GB             |
-| 磁碟 | 20 GB 可用空間                       | 50 GB            |
-| 網路 | 可對外連線 `*.services.ai.azure.com` | —                |
-
----
-
-## A-2. 容器一：Qdrant（向量資料庫）
-
-| 項目           | 設定值                                                                 |
-| -------------- | ---------------------------------------------------------------------- |
-| Image          | `qdrant/qdrant:latest`                                                 |
-| Container name | `qdrant`                                                               |
-| Port mapping   | `6333:6333`（HTTP REST），`6334:6334`（gRPC）                          |
-| Volume         | VM 本機路徑（例如 `/data/qdrant_storage`）掛載至容器 `/qdrant/storage` |
-| Restart policy | `unless-stopped`                                                       |
-| Network        | 與 `api` 容器同一個 internal network（例如 `rag-net`）                 |
-| 環境變數       | 無需設定，使用預設值即可                                               |
-
-**注意事項：**
-
-- Port `6333`、`6334` **不需對外開放**，只供同 VM 上的 `api` 容器內部使用。
-- Volume 路徑請確保有讀寫權限，且不會被定期清除。
-
----
-
-## A-3. 容器二：api（FastAPI RAG 服務）
-
-| 項目           | 設定值                                                     |
-| -------------- | ---------------------------------------------------------- |
-| 建置方式       | 從 repo 根目錄 `rag/Dockerfile` 建置，或由開發者提供 image |
-| Container name | `api`                                                      |
-| Port mapping   | `8000:8000`                                                |
-| Restart policy | `unless-stopped`                                           |
-| Network        | 與 `qdrant` 容器同一個 internal network                    |
-| 依賴           | 需等 `qdrant` 容器健康後再啟動                             |
-
-**必要環境變數（請向開發者取得實際值後填入）：**
-
-| 環境變數           | 說明                                             | 範例                                                        | 位置       |
-| ------------------ | ------------------------------------------------ | ----------------------------------------------------------- | ---------- |
-| `FOUNDRY_API_KEY`  | Azure AI Foundry API Key（機敏，不得寫入程式碼） | `rGeQ...`                                                   | `rag/.env` |
-| `FOUNDRY_BASE_URL` | Foundry endpoint                                 | `https://hub-supernote-dev.services.ai.azure.com/openai/v1` | `rag/.env` |
-
-**其他環境變數（維運同事在 Docker 容器中設定，開發者無需修改）：**
-
-| 環境變數          | 說明                                              | 範例                     | 預設位置         |
-| ----------------- | ------------------------------------------------- | ------------------------ | ---------------- |
-| `EMBEDDING_MODEL` | Embedding 模型名稱                                | `text-embedding-3-large` | rag/config.py    |
-| `LLM_DEPLOYMENT`  | LLM 部署名稱                                      | `gpt-5.4-nano`           | rag/config.py    |
-| `QDRANT_HOST`     | Qdrant 容器的 hostname（Docker network 內）       | `qdrant`                 | Docker env       |
-| `QDRANT_PORT`     | Qdrant port                                       | `6333`                   | Docker env       |
-| `COLLECTION_NAME` | Qdrant collection 名稱                            | `fit_docs`               | rag/config.py    |
-| `JSONL_PATH`      | 來源 JSONL 路徑（容器內路徑，見下方 Volume 設定） | `/data/index.jsonl`      | Docker env       |
-| `API_KEY`         | 保護 `/query` 端點的 API Key（留空 = 不驗證）     | 自訂強密碼或留空         | rag/.env（可選） |
-
-**建議 Volume（供 ingest 時掛載來源資料）：**
-
-| VM 路徑                           | 容器路徑 | 說明                                                   |
-| --------------------------------- | -------- | ------------------------------------------------------ |
-| `/data/fitwebparsing/output/rag/` | `/data/` | 爬蟲輸出資料夾，`ingest.py` 會讀取其中的 `index.jsonl` |
-
----
-
-## A-4. 防火牆設定
-
-| Port   | 方向       | 說明                           |
-| ------ | ---------- | ------------------------------ |
-| `8000` | 對內網開放 | FastAPI API，限內網或 VPN 存取 |
-| `6333` | 僅 VM 內部 | Qdrant HTTP，**不對外**        |
-| `6334` | 僅 VM 內部 | Qdrant gRPC，**不對外**        |
-
----
-
-## A-5. 完成確認
-
-維運同事完成後，請確認並回覆開發者以下資訊：
-
-```
-✅ qdrant 容器：running，port 6333/6334 可從 api 容器存取
-✅ api 容器：running，port 8000 可從 VM 內網存取
-✅ /data/ volume 已掛載，可讀寫
-✅ 環境變數已設定
-✅ VM IP 或 hostname：___________
+```text
+公司內網使用者
+      │
+      │ HTTPS
+      ▼
+反向代理（Nginx / IIS）
+      │ localhost HTTP
+      ▼
+ABS Agent FastAPI 服務（Uvicorn）
+      ├─ SQLite：會話與回饋
+      ├─ Agent allowlist：chatbot/agents.json
+      └─ Service Principal + 憑證
+                │ HTTPS 443
+                ▼
+       Microsoft Entra ID
+                │
+                ▼
+       Microsoft Foundry Project / Published Agents
 ```
 
----
+## 2. 主機與網路需求
 
-# Part B｜給開發者：程式碼部署與日常操作
+| 項目      | 建議                                                 |
+| --------- | ---------------------------------------------------- |
+| 作業系統  | Ubuntu 22.04 LTS 或更新版本                          |
+| CPU / RAM | 至少 2 vCPU / 4 GB RAM；建議 4 vCPU / 8 GB RAM       |
+| Python    | Python 3.11 以上                                     |
+| 網路輸出  | TCP 443 至 Entra ID 與目標 `*.services.ai.azure.com` |
+| 網路輸入  | 僅內網反向代理的 HTTPS；Uvicorn 不直接公開給使用者   |
+| 儲存空間  | 10 GB 以上；SQLite 與日誌需求視使用量成長            |
+| 執行帳號  | 專屬的低權限 Linux service account，例如 `absagent`  |
 
-> **前提**：Part A 的 Docker 環境已由維運同事建立完成。
+不需要部署 Qdrant、Docker、向量索引、RAG API 或 MCP server。
 
----
+## 3. Azure／Entra 身分設計
 
-## B-1. 取得程式碼並設定環境變數
+### 3.1 使用 Service Principal + 憑證
 
-```bash
-git clone <repo-url> AI-SUPERNOTES
-cd AI-SUPERNOTES
+正式內網主機不應使用開發者的 `az login`。建立兩個分開的 App Registration：
+
+| 環境       | 建議名稱         | 說明                 |
+| ---------- | ---------------- | -------------------- |
+| 開發／測試 | `abs-agent-dev`  | 開發機與整合測試使用 |
+| 正式環境   | `abs-agent-prod` | 僅正式網站主機使用   |
+
+每個 App Registration 使用自己的憑證與到期日，避免開發環境的憑證外洩影響正式環境。
+
+### 3.2 建立與授權流程
+
+1. Entra ID 建立單一租戶 App Registration。
+2. 為每個環境建立一張 Client Authentication 憑證。
+3. 在 App Registration 的 **Certificates & secrets** 上傳公開憑證（`.cer`／`.pem` 公鑰）。
+4. 將私鑰 `.pfx`／`.pem` 只放在對應服務主機。
+5. 在目標 Foundry Project 的 IAM，將 Service Principal 指派最低必要角色；通常從 `Azure AI User` 開始。
+6. 使用主機的 Service Principal 進行 Agent 呼叫測試。
+
+若 `Azure AI User` 不足以進行目標操作，應依 Foundry 回傳的授權錯誤，由資源管理員評估是否必須增加 `Azure AI Developer`。不要先給 Owner、Contributor 或 Subscription 範圍角色。
+
+### 3.3 服務帳號設定
+
+建議私鑰位置為 `/etc/abs-agent/certs/abs-agent-prod.pfx`，且只允許服務帳號讀取：
+
+```text
+擁有者：absagent
+群組：absagent
+權限：0600
 ```
 
-建立 `rag/.env`（從範本複製）：
+正式環境設定值應由 systemd 的 `EnvironmentFile`、受管祕密服務或公司密碼管理系統提供：
 
-```bash
-cp rag/.env.example rag/.env
+```dotenv
+AZURE_TENANT_ID=<tenant-id>
+AZURE_CLIENT_ID=<application-client-id>
+AZURE_CLIENT_CERTIFICATE_PATH=/etc/abs-agent/certs/abs-agent-prod.pfx
+AZURE_CLIENT_CERTIFICATE_PASSWORD=<由祕密管理系統提供>
 ```
 
-編輯 `rag/.env`，填入以下必填值：
+不要把私鑰或密碼放進 Git、Docker image、一般使用者家目錄或可被備份／同步的共用資料夾。
 
-```bash
-FOUNDRY_API_KEY=<向負責人取得>
-FOUNDRY_BASE_URL=https://hub-supernote-dev.services.ai.azure.com/openai/v1
-```
+## 4. 應用程式安全設計
 
-其餘參數（`QDRANT_HOST`、`JSONL_PATH` 等）已有預設值或由維運同事在 Docker 環境變數中設定，開發者無需修改。
+### 4.1 使用者驗證與 Foundry 認證分離
 
----
+- 網站使用者可以使用公司本地帳密登入；不需要 O365 帳號。
+- 後端固定使用 Service Principal 呼叫 Foundry；使用者永遠不接觸 Azure CLI、device code 或 Azure Token。
+- 目前程式尚未實作本地帳密登入、角色或使用者管理。正式開放前必須補上此功能，或在反向代理／既有內網身分系統進行驗證。
 
-## B-2. 確認容器正常 & 資料已就位
+### 4.2 授權與資料範圍
 
-```bash
-# 確認 api 容器服務正常（由維運同事操作，此處只驗證）
-curl http://<vm-ip>:8000/health
-# 預期：{"status":"ok","points_count":0,"bm25_ready":false}
-# points_count=0 代表尚未 ingest，屬正常
+Foundry Agent 以 Service Principal 身分存取資源，不會自動套用網站使用者個別的 SharePoint 權限。因此：
 
-# 確認 JSONL 資料存在
-ls <維運同事掛載路徑>/index.jsonl
-```
+- 只將所有登入者都可存取的資料提供給此 Agent，或
+- 在後端依使用者角色選擇不同 Agent／知識來源並驗證授權。
 
----
+前端隱藏選項不能取代後端授權檢查。
 
-## B-3. 執行資料向量化（首次，或有新資料時）
+### 4.3 網路與 TLS
 
-```bash
-# 建立 Python 虛擬環境
-python3 -m venv rag/.venv
-source rag/.venv/bin/activate      # Windows: rag\.venv\Scripts\Activate.ps1
-pip install -r rag/requirements.txt
+- 使用 Nginx 或 IIS 對外提供 HTTPS，並限制為公司內網／VPN。
+- Uvicorn 只綁定 `127.0.0.1`。
+- 對反向代理啟用 HTTPS、適當的請求大小限制與存取日誌。
+- 保護 `chatbot/chat.db`，並建立加密備份與保留政策。
 
-cd rag
+## 5. 設定檔責任
 
-# 先 dry-run 確認筆數
-python ingest.py --dry-run
+| 檔案／位置                     | 用途                   | 是否可提交 Git     |
+| ------------------------------ | ---------------------- | ------------------ |
+| `chatbot/agents.json`          | Agent 白名單與版本     | 可；限制儲存庫權限 |
+| `chatbot/.env.example`         | 非機密範本             | 可                 |
+| `chatbot/.env`                 | 本機開發設定           | 不可               |
+| `/etc/abs-agent/abs-agent.env` | 正式主機機密設定       | 不可               |
+| `/etc/abs-agent/certs/*.pfx`   | Service Principal 私鑰 | 不可               |
+| `chatbot/chat.db`              | 對話紀錄               | 不可               |
 
-# 正式執行
-python ingest.py
-```
+## 6. 監控與維運
 
-> **時間估計**：11,607 筆、批次 16，約 **30~60 分鐘**（視 Foundry 回應速度）。
-> 中途 `Ctrl+C` 可中斷，重跑會自動跳過已處理文件。
+至少監控：
 
-完成後驗證：
+- systemd 服務是否存活與重啟次數。
+- Foundry 請求的失敗率、延遲與 `401`／`403` 回應。
+- Service Principal 憑證到期日；建議在到期前 60、30、7 天通知。
+- SQLite 檔案大小、可用磁碟空間與備份完成狀態。
+- 反向代理的 HTTP 5xx、異常流量與 TLS 憑證期限。
 
-```bash
-curl http://<vm-ip>:8000/health
-# 預期：{"status":"ok","points_count":<>0,"bm25_ready":true}
-```
-
----
-
-## B-4. 驗證查詢功能
-
-```bash
-curl -X POST http://<vm-ip>:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{"question": "FIT AI lab 有哪些專案？", "top_k": 5}'
-```
-
-自動化測試（完整 20 題評測）：
-
-```bash
-python tests/run_tests.py --base-url http://<vm-ip>:8000
-```
-
-詳見 [docs/TESTING.md](TESTING.md)。
-
----
-
-## B-5. 更新程式碼後重建 api 容器
-
-程式碼修改後，請通知維運同事重建 `api` 容器（或若有 CI/CD 流程，走 pipeline）。
-
-> **注意**：本地開發時無需此步驟。只有維運同事在 VM 上需要執行。
-
-**開發者提供給維運同事的指令：**
-
-```bash
-# 在 VM 上執行
-cd ~/volume/AI-SUPERNOTES
-git pull  # 更新程式碼
-
-docker build -t rag-api ./rag
-docker stop api && docker rm api
-docker run -d --name api \
-  --network rag-net \
-  --restart unless-stopped \
-  -p 8000:8000 \
-  --env-file /path/to/rag.env \
-  -v /data:/data \
-  rag-api
-```
-
----
-
-## B-6. 增量更新資料（爬蟲有新資料後）
-
-```bash
-source rag/.venv/bin/activate
-cd rag
-python ingest.py          # 只處理新增文件
-```
-
-完成後通知維運同事重啟 `api` 容器（重建 BM25 index）：
-
-```bash
-docker restart api
-```
-
----
-
-## B-7. 常見問題排查
-
-| 現象                                | 排查步驟                                               |
-| ----------------------------------- | ------------------------------------------------------ |
-| `/health` 無回應                    | 確認 `api` 容器 running；確認防火牆 port 8000 已開放   |
-| `points_count: 0`                   | Ingest 未執行，重跑 `python ingest.py`                 |
-| `/query` 回傳 503                   | api 容器剛啟動，BM25 index 建立中（等 30~60 秒後重試） |
-| Ingest 失敗：`FOUNDRY_API_KEY` 無效 | 確認 `rag/.env` 的 key 正確，重跑 `python ingest.py`   |
-| Ingest 失敗：無法連線 Qdrant        | 確認 `QDRANT_HOST` 設定正確，容器間 network 連通       |
-| Ingest 中途中斷                     | 直接重跑，增量模式自動續跑                             |
+部署及日常操作請見 [DEPLOYMENT.md](DEPLOYMENT.md)。
