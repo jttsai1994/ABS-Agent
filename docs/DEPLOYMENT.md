@@ -90,6 +90,14 @@ AZURE_CLIENT_CERTIFICATE_PASSWORD=<pfx-password>
 # 選用：限制直接存取 Uvicorn 的內部 API key。
 # 設定後，Nginx 必須注入相同的 X-Chatbot-Key 標頭。
 CHATBOT_API_KEY=<random-secret>
+
+# 本地帳密與工作階段設定
+LOCAL_AUTH_ENABLED=true
+ALLOW_SELF_REGISTRATION=true
+AUTH_SESSION_DAYS=14
+COOKIE_SECURE=true
+BOOTSTRAP_ADMIN_USERNAME=<first-admin-username>
+BOOTSTRAP_ADMIN_PASSWORD=<long-unique-password>
 ```
 
 保護檔案：
@@ -99,7 +107,7 @@ sudo chown root:absagent /etc/abs-agent/abs-agent.env
 sudo chmod 640 /etc/abs-agent/abs-agent.env
 ```
 
-> `CHATBOT_API_KEY` 僅限制直接存取 Uvicorn；它不是完整的使用者登入機制，也不會識別使用者。若要提供本地帳密登入，需另外實作安全的帳號、密碼雜湊、session、CSRF 防護與角色授權。
+> `CHATBOT_API_KEY` 僅限制直接存取 Uvicorn；它不是使用者登入機制。應用程式已提供 Argon2 密碼雜湊、HttpOnly session cookie、CSRF 驗證、角色與群組 Agent 授權；HTTPS 部署時必須設定 `COOKIE_SECURE=true`。
 
 ## 6. 建立 systemd 服務
 
