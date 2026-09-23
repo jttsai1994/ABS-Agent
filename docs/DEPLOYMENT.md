@@ -1,59 +1,83 @@
-# ABS Agent 部署與維運手冊
+# ABS Agent 部署與維運手冊 — Docker Compose
 
-本文件說明如何在公司內網 Linux 主機部署目前的 Foundry Agent Chatbot。架構與安全前提請先閱讀 [DEPLOY.md](DEPLOY.md)。
+本文件提供完整的 Docker 容器化部署與日常維運步驟。
 
-## 1. 部署前檢查
+**前置條件：** 請先閱讀 [DEPLOY.md](DEPLOY.md)，了解以下設計原則：
 
-- 已取得目標 Foundry Project 的 Published Agent 名稱、版本與 Project endpoint。
-- 已建立正式用 Service Principal，並已授與目標 Foundry Project 必要角色。
-- 已將私鑰 `.pfx`／`.pem` 安全放在主機上。
-- 主機可透過 TCP 443 連線至 Entra ID 與 Foundry endpoint。
-- 已準備內網 DNS、TLS 憑證與反向代理設定。
-- 已確認對話資料保存與備份政策。
+- 目標架構（Docker 容器化）與網路需求
+- Azure Service Principal 與憑證的生成、上傳、安全管理
+- 應用程式安全設計（使用者驗證、授權、資料範圍）
+- 監控與備份政策
 
-## 2. 建立服務帳號與目錄
+本手冊假設上述設計已被組織認可，且您已完成憑證準備。
 
-以下命令由具 `sudo` 權限的維運人員執行：
+---
 
-```bash
-sudo useradd --system --create-home --shell /usr/sbin/nologin absagent
-sudo install -d -o absagent -g absagent -m 750 /opt/abs-agent
-sudo install -d -o absagent -g absagent -m 700 /etc/abs-agent/certs
-sudo install -d -o absagent -g absagent -m 750 /var/lib/abs-agent
-```
+## 1. 部署前檢查清單
 
-將專案程式部署至 `/opt/abs-agent`，並確保服務帳號可讀取程式與寫入 `/var/lib/abs-agent`。
+部署前，確保以下條件已完備：
 
-```bash
-sudo chown -R absagent:absagent /opt/abs-agent /var/lib/abs-agent
-```
+- ✅ **Docker 與 Docker Compose 已安裝**（Docker 20.10+, Compose 2.0+）
+- ✅ **Foundry Project endpoint、Agent 名稱、版本已取得**（例如 `https://<resource>.services.ai.azure.com/api/projects/<id>`）
+- ✅ **Azure App Registration 已建立**（應用程式 ID 與租戶 ID）
+- ✅ **Service Principal 憑證已生成**（`.cer` / `.pfx` 檔案）
+- ✅ **`.cer` 已上傳至 Azure App Registration**（Certificates & secrets）
+- ✅ **Service Principal 已在 Foundry Project 取得 `Azure AI User` 角色**
+- ✅ **`.pfx` 私鑰已安全儲存在主機**（權限 `600`）
+- ✅ **內網 DNS、TLS 憑證（HTTPS）與 Nginx 反向代理已準備**
+- ✅ **對話資料保存與備份政策已確認**
 
-## 3. 安裝 Python 套件
+---
+
+## 2. 準備 Docker 環境檔案
+
+### 2.1 複製並編輯環境檔
+
+在部署目錄（例如 `/opt/abs-agent/`）準備以下檔案：
+
+**複製範本檔案：**
 
 ```bash
 cd /opt/abs-agent
-sudo -u absagent python3 -m venv .venv
-sudo -u absagent .venv/bin/python -m pip install --upgrade pip
-sudo -u absagent .venv/bin/python -m pip install -r chatbot/requirements.txt
+cp chatbot/.env.example .env.prod
 ```
 
-## 4. 安裝 Service Principal 私鑰
+**編輯 `.env.prod`（機密設定，不可提交 Git）：**
 
-將正式 `.pfx`／`.pem` 安全傳送至主機，再調整檔案權限：
+```dotenv
+# ========== 應用程式設定 ==========
+CHAT_PROVIDER=foundry_agent
+FOUNDRY_AGENTS_FILE=agents.json
+FOUNDRY_DEFAULT_AGENT_ID=sharepoint  # 預設 Agent ID（改成您的 Agent）
+CHAT_DB_PATH=/data/chat.db          # 容器內 SQLite 路徑
+
+# ========== Azure Service Principal ==========
+AZURE_TENANT_ID=cdb587e9-824c-41b5-b47f-5af9864b075b
+AZURE_CLIENT_ID=e8d357a3-9259-4de2-a8ef-dea7b9826870
+AZURE_CLIENT_CERTIFICATE_PATH=/cert/abs-agent-prod.pfx
+AZURE_CLIENT_CERTIFICATE_PASSWORD=<pfx-password>
+
+# ========== 本地認證與會話 ==========
+LOCAL_AUTH_ENABLED=true
+ALLOW_SELF_REGISTRATION=false           # 改成 true 以允許自行註冊
+AUTH_SESSION_DAYS=14
+COOKIE_SECURE=true                      # HTTPS 部署時必須為 true
+BOOTSTRAP_ADMIN_USERNAME=admin
+BOOTSTRAP_ADMIN_PASSWORD=<strong-password-here>
+
+# ========== 安全設定 ==========
+CHATBOT_API_KEY=<random-32-char-secret>  # 用於 Nginx 驗證（選用）
+```
+
+**檔案權限（主機端）：**
 
 ```bash
-sudo install -o absagent -g absagent -m 600 \
-  /安全的暫存位置/abs-agent-prod.pfx \
-  /etc/abs-agent/certs/abs-agent-prod.pfx
+chmod 600 .env.prod
 ```
 
-傳送成功後，立即從暫存位置移除私鑰副本。私鑰不可放入專案目錄、Git、家目錄、備份未加密區或 Docker image。
+### 2.2 準備 Agent 白名單
 
-## 5. 設定 Agent 與機密環境變數
-
-### 5.1 Agent 白名單
-
-編輯 `/opt/abs-agent/chatbot/agents.json`，填入已發佈的 Agent。範例：
+確保 `chatbot/agents.json` 已正確填入已發佈的 Agent：
 
 ```json
 {
@@ -61,113 +85,205 @@ sudo install -o absagent -g absagent -m 600 \
     {
       "id": "sharepoint",
       "label": "SharePoint AI Search",
-      "project_endpoint": "https://<resource>.services.ai.azure.com/api/projects/<project>",
-      "agent_name": "<agent-name>",
-      "version": "<published-version>",
+      "project_endpoint": "https://<resource>.services.ai.azure.com/api/projects/<project-id>",
+      "agent_name": "SharePoint",
+      "version": "2025-01-15",
       "enabled": true
     }
   ]
 }
 ```
 
-更新版本時，只變更 `version` 並重啟服務。Agent 必須先在 Foundry Publish。
+---
 
-### 5.2 正式主機環境檔
+## 3. 準備 Service Principal 私鑰
 
-建立 `/etc/abs-agent/abs-agent.env`：
+### 3.1 安全放置 `.pfx` 檔案
 
-```dotenv
-CHAT_PROVIDER=foundry_agent
-FOUNDRY_AGENTS_FILE=agents.json
-FOUNDRY_DEFAULT_AGENT_ID=sharepoint
-CHAT_DB_PATH=/var/lib/abs-agent/chat.db
-
-AZURE_TENANT_ID=<tenant-id>
-AZURE_CLIENT_ID=<app-registration-client-id>
-AZURE_CLIENT_CERTIFICATE_PATH=/etc/abs-agent/certs/abs-agent-prod.pfx
-AZURE_CLIENT_CERTIFICATE_PASSWORD=<pfx-password>
-
-# 選用：限制直接存取 Uvicorn 的內部 API key。
-# 設定後，Nginx 必須注入相同的 X-Chatbot-Key 標頭。
-CHATBOT_API_KEY=<random-secret>
-
-# 本地帳密與工作階段設定
-LOCAL_AUTH_ENABLED=true
-ALLOW_SELF_REGISTRATION=true
-AUTH_SESSION_DAYS=14
-COOKIE_SECURE=true
-BOOTSTRAP_ADMIN_USERNAME=<first-admin-username>
-BOOTSTRAP_ADMIN_PASSWORD=<long-unique-password>
-```
-
-保護檔案：
+從開發機將 `abs-agent-prod.pfx` 安全複製到部署主機：
 
 ```bash
-sudo chown root:absagent /etc/abs-agent/abs-agent.env
-sudo chmod 640 /etc/abs-agent/abs-agent.env
+# 主機上建立憑證目錄
+mkdir -p /opt/abs-agent/certs
+chmod 700 /opt/abs-agent/certs
+
+# 從開發機複製（使用 scp 或安全傳輸方式）
+scp /local/path/abs-agent-prod.pfx user@production-host:/opt/abs-agent/certs/
+
+# 調整檔案權限
+chmod 600 /opt/abs-agent/certs/abs-agent-prod.pfx
 ```
 
-> `CHATBOT_API_KEY` 僅限制直接存取 Uvicorn；它不是使用者登入機制。應用程式已提供 Argon2 密碼雜湊、HttpOnly session cookie、CSRF 驗證、角色與群組 Agent 授權；HTTPS 部署時必須設定 `COOKIE_SECURE=true`。
+**安全注意事項：**
 
-## 6. 建立 systemd 服務
+- ❌ **不可**將 `.pfx` 打進 Docker image
+- ❌ **不可**提交 `.pfx` 至 Git
+- ✅ **只能**透過主機 bind mount 傳遞給容器
+- ✅ 複製完成後立即刪除開發機上的臨時 `.pfx` 副本
 
-建立 `/etc/systemd/system/abs-agent.service`：
+---
 
-```ini
-[Unit]
-Description=ABS Agent FastAPI service
-After=network-online.target
-Wants=network-online.target
+## 4. 建立 Dockerfile
 
-[Service]
-Type=simple
-User=absagent
-Group=absagent
-WorkingDirectory=/opt/abs-agent
-EnvironmentFile=/etc/abs-agent/abs-agent.env
-ExecStart=/opt/abs-agent/.venv/bin/python -m uvicorn chatbot.app:app --host 127.0.0.1 --port 8080 --proxy-headers
-Restart=always
-RestartSec=5
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ReadWritePaths=/var/lib/abs-agent
+在專案根目錄建立 `Dockerfile`：
 
-[Install]
-WantedBy=multi-user.target
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# 安裝依賴
+COPY chatbot/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 複製應用程式
+COPY chatbot/ ./chatbot/
+
+# 建立資料目錄
+RUN mkdir -p /data
+
+# 非 root 執行
+RUN useradd -m -u 1000 appuser
+USER appuser
+
+# 健康檢查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD python -c "import requests; requests.get('http://localhost:8080/api/health', timeout=5)"
+
+# 啟動
+CMD ["python", "-m", "uvicorn", "chatbot.app:app", "--host", "0.0.0.0", "--port", "8080"]
 ```
 
-啟動並查看狀態：
+---
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now abs-agent
-sudo systemctl status abs-agent
-sudo journalctl -u abs-agent -f
+## 5. 建立 docker-compose.yml
+
+在部署目錄（例如 `/opt/abs-agent/`）建立 `docker-compose.yml`：
+
+```yaml
+version: "3.9"
+
+services:
+  abs-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: abs-agent
+    ports:
+      - "127.0.0.1:8080:8080" # 僅內部存取
+    environment:
+      # 動態載入 .env.prod 檔案
+      - CHAT_PROVIDER=foundry_agent
+      - CHAT_DB_PATH=/data/chat.db
+    env_file:
+      - .env.prod
+    volumes:
+      # SQLite 資料庫持久化
+      - abs-agent-data:/data
+      # Service Principal 憑證（唯讀掛載）
+      - ./certs/abs-agent-prod.pfx:/cert/abs-agent.pfx:ro
+      # 應用程式碼（若需要即時編輯）
+      - ./chatbot/agents.json:/app/chatbot/agents.json:ro
+    restart: unless-stopped
+    networks:
+      - internal
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
+
+  # 選用：Nginx 反向代理（若主機已有 Nginx，可移除此服務）
+  nginx:
+    image: nginx:latest
+    container_name: abs-agent-nginx
+    ports:
+      - "0.0.0.0:443:443"
+      - "0.0.0.0:80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - /etc/nginx/tls/abs-agent.crt:/etc/nginx/tls/abs-agent.crt:ro
+      - /etc/nginx/tls/abs-agent.key:/etc/nginx/tls/abs-agent.key:ro
+    depends_on:
+      - abs-agent
+    networks:
+      - internal
+    restart: unless-stopped
+
+volumes:
+  abs-agent-data:
+    driver: local
+
+networks:
+  internal:
+    driver: bridge
 ```
 
-## 7. 驗證 Service Principal 與網站
+**注意：** 若主機已安裝獨立 Nginx，可省略 `nginx` 服務，改為外部 Nginx 代理。
 
-在主機上測試服務狀態：
+---
 
-```bash
-curl http://127.0.0.1:8080/api/health
-curl http://127.0.0.1:8080/api/agents
+## 6. Nginx 反向代理配置
+
+如果使用容器內的 Nginx（上述 `docker-compose.yml` 包含），準備 `nginx.conf`：
+
+```nginx
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events {
+  worker_connections 1024;
+}
+
+http {
+  include /etc/nginx/mime.types;
+  default_type application/octet-stream;
+
+  log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                  '$status $body_bytes_sent "$http_referer" '
+                  '"$http_user_agent" "$http_x_forwarded_for"';
+
+  access_log /var/log/nginx/access.log main;
+
+  sendfile on;
+  tcp_nopush on;
+  tcp_nodelay on;
+  keepalive_timeout 65;
+  types_hash_max_size 2048;
+  client_max_body_size 1m;
+
+  server {
+    listen 80;
+    server_name _;
+    # 重新導向 HTTPS
+    return 301 https://$host$request_uri;
+  }
+
+  server {
+    listen 443 ssl http2;
+    server_name <internal-hostname>;
+
+    ssl_certificate     /etc/nginx/tls/abs-agent.crt;
+    ssl_certificate_key /etc/nginx/tls/abs-agent.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location / {
+      proxy_pass http://abs-agent:8080;
+      proxy_http_version 1.1;
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_read_timeout 300s;
+      proxy_buffering off;  # SSE 直播需要
+    }
+  }
+}
 ```
 
-若需要驗證後端服務帳號取得 Token，使用環境檔啟動一次性測試；不要使用個人 `az login`：
-
-```bash
-sudo -u absagent env $(grep -v '^#' /etc/abs-agent/abs-agent.env | xargs) \
-  /opt/abs-agent/.venv/bin/python -c \
-  "from azure.identity import DefaultAzureCredential; print(DefaultAzureCredential().get_token('https://ai.azure.com/.default').expires_on)"
-```
-
-取得 token 不代表一定具備呼叫 Agent 的權限；請再從 Web UI 送出一則測試問題，確認 Foundry Project RBAC、Agent 名稱與版本正確。
-
-## 8. Nginx 反向代理範例
-
-以下範例只供內網 HTTPS 使用。將 `<internal-hostname>` 和 TLS 憑證路徑替換為實際值。
+**或，若主機上已有獨立 Nginx，改在主機 Nginx 設定代理：**
 
 ```nginx
 server {
@@ -177,14 +293,10 @@ server {
     ssl_certificate     /etc/nginx/tls/abs-agent.crt;
     ssl_certificate_key /etc/nginx/tls/abs-agent.key;
 
-    client_max_body_size 1m;
-
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
-        # 僅在設定 CHATBOT_API_KEY 時啟用；值必須與環境檔一致。
-        proxy_set_header X-Chatbot-Key <random-secret>;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
@@ -194,71 +306,166 @@ server {
 }
 ```
 
-SSE 串流需要 `proxy_buffering off` 與較長的 `proxy_read_timeout`。設定後執行：
+測試 Nginx：
 
 ```bash
 sudo nginx -t
 sudo systemctl reload nginx
 ```
 
+---
+
+## 7. 啟動容器
+
+### 7.1 建立並啟動容器
+
+```bash
+cd /opt/abs-agent
+
+# 構建 Docker image
+docker compose build
+
+# 啟動容器（後台執行）
+docker compose up -d
+
+# 檢查容器狀態
+docker compose ps
+docker compose logs -f abs-agent
+```
+
+### 7.2 驗證容器健康狀態
+
+```bash
+# 檢查容器日誌
+docker compose logs abs-agent
+
+# 測試 API 健康檢查
+curl http://127.0.0.1:8080/api/health
+
+# 測試 Agent 可用性
+curl http://127.0.0.1:8080/api/agents
+```
+
+若看到 `{"ok": true}` 回應，表示容器正常運作。
+
+---
+
+## 8. 登入與初始設定
+
+1. 在瀏覽器開啟 `https://<internal-hostname>`
+2. 使用 `BOOTSTRAP_ADMIN_USERNAME` 與 `BOOTSTRAP_ADMIN_PASSWORD` 登入
+3. 進入【管理】分頁建立額外使用者或設定 Agent 授權
+
+---
+
 ## 9. 日常維運
 
-### 更新程式碼
+### 9.1 檢查日誌
 
 ```bash
-sudo -u absagent git -C /opt/abs-agent pull
-sudo -u absagent /opt/abs-agent/.venv/bin/python -m pip install -r /opt/abs-agent/chatbot/requirements.txt
-sudo systemctl restart abs-agent
-sudo systemctl status abs-agent
+# 即時日誌
+docker compose logs -f abs-agent
+
+# 查看特定行數
+docker compose logs -n 100 abs-agent
+
+# 儲存日誌到檔案
+docker compose logs abs-agent > logs.txt
 ```
 
-### 查看日誌
+### 9.2 更新程式碼
 
 ```bash
-sudo journalctl -u abs-agent -n 100 --no-pager
-sudo journalctl -u abs-agent -f
+# 拉取最新程式碼
+git pull
+
+# 重建 image
+docker compose build
+
+# 重啟容器
+docker compose restart abs-agent
+
+# 驗證
+docker compose logs -f abs-agent
 ```
 
-### 備份與還原對話資料
+### 9.3 更新 Agent 版本
 
-先停止服務或使用 SQLite 在線備份方式，再備份資料庫：
+1. 在 Foundry 發佈新版本
+2. 編輯 `chatbot/agents.json`，更新 `version` 欄位
+3. 重啟容器：`docker compose restart abs-agent`
+4. 從 UI 建立新對話測試
+
+### 9.4 備份 SQLite 資料庫
 
 ```bash
-sudo systemctl stop abs-agent
-sudo cp /var/lib/abs-agent/chat.db /secure-backup/abs-agent-chat-$(date +%F).db
-sudo chown absagent:absagent /var/lib/abs-agent/chat.db
-sudo systemctl start abs-agent
+# 停止容器
+docker compose stop abs-agent
+
+# 備份資料庫
+docker run --rm -v abs-agent-data:/data -v $(pwd):/backup \
+  alpine cp /data/chat.db /backup/chat.db.$(date +%F-%H%M%S)
+
+# 重啟容器
+docker compose start abs-agent
 ```
 
-備份檔含使用者對話內容，必須依公司資料分類與保留規範加密及控管存取。
+### 9.5 恢復資料庫備份
 
-### 更新 Agent 版本
+```bash
+# 停止容器
+docker compose stop abs-agent
 
-1. 在 Foundry Publish 新版本。
-2. 更新 `chatbot/agents.json` 的 `version`。
-3. 驗證 JSON 格式與 Agent ID。
-4. `sudo systemctl restart abs-agent`。
-5. 從 UI 新建對話並測試。
+# 恢復備份
+docker run --rm -v abs-agent-data:/data -v $(pwd):/backup \
+  alpine cp /backup/chat.db.2025-01-15-120000 /data/chat.db
+
+# 重啟容器
+docker compose start abs-agent
+```
+
+---
 
 ## 10. 故障排除
 
-| 現象                          | 檢查方式                                                                                           |
-| ----------------------------- | -------------------------------------------------------------------------------------------------- |
-| 服務無法啟動                  | `sudo journalctl -u abs-agent -n 100 --no-pager`；檢查 `.env`、`agents.json` 與 Python 套件。      |
-| `DefaultAzureCredential` 失敗 | 確認 `AZURE_TENANT_ID`、`AZURE_CLIENT_ID`、憑證路徑、密碼與檔案權限；正式環境不應依賴 `az login`。 |
-| `401` 或 `403`                | 確認 App Registration 的 Service Principal 在正確 Foundry Project 具有必要角色，並等待 RBAC 傳播。 |
-| 找不到 Agent／版本            | Agent 必須 Publish；確認 `agents.json` 的 endpoint、name、version。                                |
-| UI 等待但沒有回覆             | 查 `journalctl` 的 Foundry 呼叫錯誤，並確認 Nginx 已設定 `proxy_buffering off`。                   |
-| SQLite locked                 | 確認只執行一個應用程式實例；多副本部署需改用共用的資料庫與會話設計。                               |
+| 現象                    | 檢查方式                                                                                                    |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------- |
+| 容器無法啟動            | `docker compose logs abs-agent` 查看錯誤訊息；檢查 `.env.prod`、`agents.json`、憑證路徑                     |
+| `401 Unauthorized` 錯誤 | 檢查 `.pfx` 密碼、`AZURE_CLIENT_CERTIFICATE_PASSWORD`、憑證是否已上傳 Azure                                 |
+| `403 Forbidden` 錯誤    | 確認 Service Principal 在 Foundry Project 具有 `Azure AI User` 或更高角色；等待 RBAC 傳播（通常 5-10 分鐘） |
+| Agent 找不到或版本錯誤  | 檢查 `agents.json` 的 endpoint、agent_name、version 是否正確發佈                                            |
+| SQLite locked 錯誤      | 確保只有一個應用程式實例在執行；若需多實例，改用共用資料庫                                                  |
+| Nginx 連線拒絕          | 檢查防火牆規則、TLS 憑證有效期、主機 DNS 解析                                                               |
+
+### 10.1 深度診斷
+
+```bash
+# 進入容器終端
+docker compose exec abs-agent bash
+
+# 在容器內測試 Service Principal
+python -c "from azure.identity import DefaultAzureCredential; \
+  c = DefaultAzureCredential(); \
+  token = c.get_token('https://ai.azure.com/.default'); \
+  print('Token expires:', token.expires_on)"
+
+# 檢查環境變數
+env | grep AZURE
+
+# 檢查檔案掛載
+ls -la /cert/
+ls -la /data/
+```
+
+---
 
 ## 11. 不再適用的舊版項目
 
 請勿依照舊文件啟動下列元件：
 
-- `docker compose up qdrant`
-- `rag/ingest.py`
-- RAG API 的 `/query`、`/query/stream`
-- MCP server
-- `FOUNDRY_API_KEY` 舊版設定
+- ❌ Qdrant 向量資料庫
+- ❌ RAG API 服務（`/query` 端點）
+- ❌ MCP server
+- ❌ `FOUNDRY_API_KEY` 舊版設定
 
-目前版本直接呼叫已發佈的 Microsoft Foundry Agent。
+目前版本直接呼叫已發佈的 Microsoft Foundry Agent，無需向量搜尋或 RAG 管道。
