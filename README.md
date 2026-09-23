@@ -2,7 +2,7 @@
 
 FIT 內部知識問答網站。使用者透過 Web 介面選擇已發佈的 Microsoft Foundry Agent，由 FastAPI 後端以受控身分呼叫 Foundry Responses API，並以 SSE 串流顯示回答。
 
-> 本專案目前的核心是 **Microsoft Foundry Agent**，不是舊版 Qdrant／BM25 RAG 架構。根目錄的 `docker-compose.yml` 是從舊專案保留的檔案，**不會啟動目前的 Chatbot，也不應用於此版本部署**。
+**部署方式：** 本專案使用 Docker Compose 容器化部署，適用開發與正式環境。快速開始見 [docs/DOCKER_QUICKSTART.md](docs/DOCKER_QUICKSTART.md)；完整部署說明見 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
 
 ## 功能
 
@@ -37,66 +37,88 @@ ABS-Agent/
 ├── chatbot/
 │   ├── app.py                 # FastAPI、SSE、會話與 Foundry Agent 代理
 │   ├── agents.json            # 可使用 Agent 的伺服器端白名單
-│   ├── .env.example           # 非機密設定範本
+│   ├── .env.example           # 開發用環境設定範本
 │   ├── requirements.txt
 │   └── static/index.html      # 單頁聊天介面
 ├── docs/
-│   ├── DEPLOY.md              # 給維運／架構人員的部署設計
-│   └── DEPLOYMENT.md          # 給部署與日常維護人員的操作手冊
-├── docker-compose.yml         # 舊版 RAG 遺留檔案；目前不使用
+│   ├── DEPLOY.md              # 給架構人員的 Docker 設計與安全要求
+│   ├── DEPLOYMENT.md          # 給部署與維運人員的完整操作手冊
+│   ├── DOCKER_QUICKSTART.md   # 開發與生產快速啟動指南
+│   └── TESTING.md             # 測試指南
+├── Dockerfile                 # Python 3.11-slim，非 root appuser
+├── docker-compose.yml         # FastAPI + Nginx 反向代理服務定義
+├── nginx.conf                 # HTTPS 反向代理與安全標頭
+├── .env.prod.example          # 正式環境環境設定範本（不提交 .env.prod）
 └── README.md
 ```
 
-## 快速開始：本機開發
+## 快速開始
 
-### 1. 建立 Python 環境並安裝套件
+### 推薦方式：Docker Compose（3 分鐘內啟動）
+
+```bash
+# 複製環境檔
+cp .env.prod.example .env.prod
+
+# 編輯 .env.prod，填入 Azure Service Principal 認證
+# （開發時可先留著預設值測試）
+
+# 構建與啟動
+docker compose build
+docker compose up -d
+
+# 檢查日誌
+docker compose logs -f abs-agent
+
+# 開啟瀏覽器
+# http://127.0.0.1:8080
+```
+
+詳見 [docs/DOCKER_QUICKSTART.md](docs/DOCKER_QUICKSTART.md)。
+
+### 備選方式：本機 Python venv（傳統開發）
+
+若不使用 Docker，可直接用 Python 虛擬環境：
 
 ```powershell
+# 建立虛擬環境
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r chatbot/requirements.txt
-```
 
-### 2. 建立設定檔
-
-```powershell
+# 設定環境
 Copy-Item chatbot/.env.example chatbot/.env
 ```
 
-設定 `chatbot/.env`：
+編輯 `chatbot/.env`：
 
 ```dotenv
 CHAT_PROVIDER=foundry_agent
 FOUNDRY_AGENTS_FILE=agents.json
 FOUNDRY_DEFAULT_AGENT_ID=sharepoint
+CHAT_DB_PATH=chatbot/chat.db
 ```
 
-`chatbot/agents.json` 是 Agent 白名單。每個 Agent 必須已在 Foundry **Publish**，且需填入正確的 Project endpoint、Agent name 與 version。
+設定 Azure 認證（二選一）：
 
-### 3. 設定 Azure 認證
-
-可選其中一種方式：
-
-- **開發者 Azure CLI**：執行 `az login --tenant <tenant-id>`。適合暫時的本機開發。
-- **Service Principal 憑證**：建議用於本機整合測試與正式內網主機。設定以下環境變數後，程式會自動使用 `EnvironmentCredential`：
+- **開發者 Azure CLI**：`az login --tenant <tenant-id>`（暫時開發用）
+- **Service Principal 憑證**：見 [docs/DEPLOY.md](docs/DEPLOY.md) 第 3 節
 
 ```dotenv
 AZURE_TENANT_ID=<tenant-id>
 AZURE_CLIENT_ID=<app-registration-client-id>
-AZURE_CLIENT_CERTIFICATE_PATH=<僅伺服器可讀取的 .pfx 或 .pem 路徑>
+AZURE_CLIENT_CERTIFICATE_PATH=<.pfx 或 .pem 路徑>
 AZURE_CLIENT_CERTIFICATE_PASSWORD=<私鑰密碼>
 ```
 
-Service Principal 必須在目標 Foundry Project 具有最低必要權限，通常由 `Azure AI User` 開始授權。詳細憑證與權限做法請見 [docs/DEPLOY.md](docs/DEPLOY.md)。
-
-### 4. 啟動網站
+啟動應用程式：
 
 ```powershell
 .\.venv\Scripts\python.exe -m uvicorn chatbot.app:app --host 127.0.0.1 --port 8080
 ```
 
-開啟 <http://127.0.0.1:8080>，並可用下列端點確認狀態：
+開啟 <http://127.0.0.1:8080> 並測試：
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8080/api/health
@@ -143,18 +165,21 @@ Invoke-RestMethod http://127.0.0.1:8080/api/agents
 
 ## 安全注意事項
 
-- `.env`、`.pfx`、`.pem`、密碼與 Client Secret 不得提交至 Git。
-- 正式環境不要使用個人 Azure CLI 登入；請使用獨立的 Service Principal 憑證。
-- PFX 私鑰僅授權給執行 Uvicorn 的服務帳號讀取。
+- ❌ **不得**提交至 Git：`.env.prod`、`certs/*.pfx`、`.env` 內含密碼、Client Secret。
+- ✅ **可在 Git 中**：`.env.example`、`.env.prod.example`（作為配置範本）。
+- 正式環境必須使用 Service Principal 憑證，**不可**依賴個人 Azure CLI 登入。
+- Docker 部署時，`.pfx` 檔案只能透過 **bind mount**（唯讀）傳遞給容器，不可打進 image。
 - 已提供本地帳密登入、Argon2 密碼雜湊、HttpOnly session cookie、CSRF 驗證、`admin`／`user` 角色、群組 Agent 授權、會話擁有者隔離與稽核紀錄。
 - 部署時透過 `BOOTSTRAP_ADMIN_USERNAME` 與 `BOOTSTRAP_ADMIN_PASSWORD` 建立第一位管理員；這兩個值只能放在受保護的主機祕密設定中。
-- 對內網正式開放時仍必須使用 HTTPS 反向代理，並將 `COOKIE_SECURE=true`。
-- Foundry／SharePoint 資料會以後端 Service Principal 的權限存取；應在網站後端另行實作部門、廠區或角色的資料授權規則。
+- 對內網正式開放時必須使用 HTTPS、COOKIE_SECURE=true，並設置 Nginx 反向代理（見 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)）。
+- Foundry／SharePoint 資料會以後端 Service Principal 的權限存取；應在應用程式或 Foundry Project RBAC 層另行限制資料存取範圍。
 
 ## 文件
 
-- [部署設計與安全要求](docs/DEPLOY.md)
-- [部署、啟動與維運操作](docs/DEPLOYMENT.md)
+- [快速開始 — Docker](docs/DOCKER_QUICKSTART.md)（推薦閱讀）
+- [部署設計與安全要求](docs/DEPLOY.md)（給架構人員）
+- [部署、啟動與維運操作](docs/DEPLOYMENT.md)（給維運人員）
+- [測試指南](docs/TESTING.md)
 
 ## 授權
 
